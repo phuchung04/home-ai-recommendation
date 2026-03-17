@@ -26,6 +26,7 @@ class RecommendRequest(BaseModel):
     furniture_density: FurnitureDensity = Field(..., example="medium")
     gender: Gender = Field(..., example="female")
     age: Optional[int] = Field(None, gt=0, description="User's age", example=25)
+    user_id: Optional[str] = None  # ← thêm để CF scoring
 
 
 # ---------- Gemini Analysis Output ----------

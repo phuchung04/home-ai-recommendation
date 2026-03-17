@@ -15,7 +15,7 @@ from app.services.mongo_service import get_recommendations, get_recommendations_
 
 router = APIRouter()
 
-USE_MOCK_DB = os.getenv("USE_MOCK_DB", "true").lower() == "true"
+USE_MOCK_DB = os.getenv("USE_MOCK_DB", "false").lower() == "true"
 
 
 @router.post("/recommend", response_model=RecommendResponse)
@@ -28,6 +28,7 @@ async def recommend_furniture(
     furniture_density: FurnitureDensity = Form(..., example="medium"),
     gender: Gender = Form(..., example="female"),
     age: Optional[int] = Form(None, example=25),
+    user_id: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
 ):
     """
@@ -44,6 +45,7 @@ async def recommend_furniture(
         furniture_density=furniture_density,
         gender=gender,
         age=age,
+        user_id=user_id,
     )
 
     # 2. Read image bytes if provided
@@ -64,7 +66,9 @@ async def recommend_furniture(
         if USE_MOCK_DB:
             products, total_candidates = await get_recommendations_mock(analysis)
         else:
-            products, total_candidates = await get_recommendations(analysis)
+            products, total_candidates = await get_recommendations(
+                analysis, user_id=req.user_id, top_n=20
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database query failed: {exc}")
 

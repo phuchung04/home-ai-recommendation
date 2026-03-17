@@ -10,6 +10,7 @@ from typing import List, Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
+from app.services.cf_model import get_cf_scores
 from app.models.schemas import GeminiAnalysisResult, Product, ProductDimensions
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -78,12 +79,13 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
 
 async def get_recommendations(
     analysis: GeminiAnalysisResult,
+    user_id: str = None,
     top_n: int = 20,
     candidate_limit: int = 70,
 ) -> tuple[List[Product], int]:
     """
     1. Hard-filter up to `candidate_limit` products from MongoDB.
-    2. Rank using a weighted score: style, color, and availability.
+    2. Rank using a weighted score: style, color, availability, and collaborative filtering.
     3. Return top_n products + total candidates count.
     """
     db = get_client()[DB_NAME]
@@ -95,33 +97,69 @@ async def get_recommendations(
     target_styles_lower = {s.lower() for s in rf.styles}
 
     cursor = col.find(query).limit(candidate_limit)
-    candidates: List[Product] = []
+    
+    # Step 1: Gather candidates and their raw scores
+    candidate_data = []
+    product_ids_for_cf = []
     max_color_dist = 441.67  # Max possible Euclidean distance in RGB
 
     async for doc in cursor:
         prod_styles = doc.get("styles", [])
-        prod_colors = doc.get("colors", [])
-        is_in_stock = doc.get("inStock", True)  # Assume True if not present
+        color_obj = doc.get("color", {})
+        prod_colors = [color_obj.get("hex")] if color_obj and color_obj.get("hex") else []
+        is_in_stock = doc.get("inStock", True)
 
-        # --- Scoring ---
-        # 1. Style Match Score (0.0 - 1.0)
+        # Individual scores
         prod_styles_lower = {s.lower() for s in prod_styles}
         matching_styles = len(target_styles_lower.intersection(prod_styles_lower))
         style_match_score = min(matching_styles / (len(target_styles_lower) or 1), 1.0)
 
-        # 2. Color Score (0.0 - 1.0)
         color_dist = _min_color_distance(prod_colors, target_colors)
         color_score = 1.0 - (color_dist / max_color_dist)
 
-        # 3. In-stock Score (0 or 1)
         in_stock_score = 1.0 if is_in_stock else 0.0
 
-        # --- Weighted Ranking ---
-        ranking_score = (
-            (style_match_score * 0.5) +
-            (color_score * 0.3) +
-            (in_stock_score * 0.2)
-        )
+        product_id = str(doc.get("_id", ""))
+        product_ids_for_cf.append(product_id)
+
+        candidate_data.append({
+            "doc": doc,
+            "product_id": product_id,
+            "scores": {
+                "style": style_match_score,
+                "color": color_score,
+                "stock": in_stock_score
+            },
+            "color_dist": color_dist,
+            "prod_colors": prod_colors,
+            "prod_styles": prod_styles,
+        })
+
+    # Step 2: Get Collaborative Filtering scores
+    cf_scores = {}
+    if user_id:
+        cf_scores = get_cf_scores(user_id, product_ids_for_cf)
+
+    # Step 3: Calculate final ranking score and build Product objects
+    candidates: List[Product] = []
+    for data in candidate_data:
+        doc = data["doc"]
+        scores = data["scores"]
+        cf_score = cf_scores.get(data["product_id"], 0.0)
+
+        if cf_scores:  # New weights if CF is active
+            ranking_score = (
+                (scores["style"] * 0.40) +
+                (scores["color"] * 0.25) +
+                (scores["stock"] * 0.15) +
+                (cf_score * 0.20)
+            )
+        else:  # Original weights
+            ranking_score = (
+                (scores["style"] * 0.5) +
+                (scores["color"] * 0.3) +
+                (scores["stock"] * 0.2)
+            )
 
         dim_raw = doc.get("dimensions", {})
         dims = ProductDimensions(
@@ -131,15 +169,15 @@ async def get_recommendations(
         ) if dim_raw else None
 
         candidates.append(Product(
-            id=str(doc.get("_id", "")),
+            id=data["product_id"],
             name=doc.get("name", ""),
             category=doc.get("category", ""),
-            styles=prod_styles,
+            styles=data["prod_styles"],
             price=doc.get("price"),
             dimensions=dims,
-            colors=prod_colors,
+            colors=data["prod_colors"],
             imageUrl=doc.get("imageUrl"),
-            color_distance=round(color_dist, 2),
+            color_distance=round(data["color_dist"], 2),
             ranking_score=round(ranking_score, 4),
         ))
 
