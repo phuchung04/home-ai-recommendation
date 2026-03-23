@@ -7,12 +7,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import recommend, training
 from app.services.cf_model import load_model
+from app.services.gemini_service import load_metadata
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load the model
     print("Loading CF model...")
     load_model()
+    await load_metadata()
     yield
     # Clean up the model and release the resources
     print("Successfully shut down")

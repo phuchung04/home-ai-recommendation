@@ -15,10 +15,15 @@ class Gender(str, Enum):
     other = "other"
 
 
+class RoomType(str, Enum):
+    LIVING_ROOM = "Living Room"
+    BEDROOM = "Bedroom"
+
+
 # ---------- Request ----------
 
 class RecommendRequest(BaseModel):
-    room_type: str = Field(..., example="living room")
+    room_type: RoomType = Field(..., example="Living Room")
     style: str = Field(..., example="modern")
     width: float = Field(..., gt=0, description="Room width in meters", example=4.5)
     length: float = Field(..., gt=0, description="Room length in meters", example=6.0)
@@ -43,10 +48,15 @@ class RecommendedFilter(BaseModel):
     styles: List[str]
     colorHexRange: List[str]
     colorTone: str
-    categories: List[str]
+    categories: "List[CategoryRecommendation]"
     maxProductWidth: float
     maxProductDepth: float
     furnitureDensityHint: str
+
+class CategoryRecommendation(BaseModel):
+    category: str
+    reasoning: str
+
 
 
 class GeminiAnalysisResult(BaseModel):
@@ -74,6 +84,7 @@ class Product(BaseModel):
     imageUrl: Optional[str] = None
     color_distance: Optional[float] = None  # semantic ranking score
     ranking_score: Optional[float] = None  # weighted ranking score
+    reasoning: Optional[str] = None
 
 
 # ---------- Response ----------

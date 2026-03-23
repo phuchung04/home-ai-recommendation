@@ -7,14 +7,53 @@ import json
 import base64
 import httpx
 import asyncio
-from typing import Optional
+from typing import Optional, List
+from fastapi import HTTPException
 
 from app.models.schemas import RecommendRequest, GeminiAnalysisResult
+from app.services.mongo_service import get_distinct_categories, get_distinct_styles
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
 )
+
+# ── Metadata Caching ─────────────────────────────────────────────────────────
+
+_cached_categories: List[str] = []
+_cached_styles: List[str] = []
+
+async def load_metadata():
+    """
+    Fetches distinct categories and styles from MongoDB and caches them.
+    This should be called at application startup.
+    """
+    global _cached_categories, _cached_styles
+    print("[Metadata] Loading distinct categories and styles from DB...")
+    
+    try:
+        # Load categories
+        categories = await get_distinct_categories()
+        if categories:
+            _cached_categories = categories
+            print(f"[Metadata] Loaded {len(_cached_categories)} categories.")
+        else:
+            print("[Metadata] Warning: No categories found in DB, using empty list.")
+
+        # Load styles and merge with the hardcoded list
+        styles_from_db = await get_distinct_styles()
+        if styles_from_db:
+            print(f"[Metadata] Found {len(styles_from_db)} styles in DB.")
+            
+            # Merge and remove duplicates, then sort
+            combined_styles = sorted(list(set(_cached_styles + styles_from_db)))
+            _cached_styles = combined_styles
+        
+        print(f"[Metadata] Final style list has {len(_cached_styles)} unique styles.")
+
+    except Exception as e:
+        print(f"[Metadata] Error loading metadata: {e}")
+        print("[Metadata] Using hardcoded fallback styles.")
 
 
 def _build_prompt(req: RecommendRequest) -> str:
@@ -35,6 +74,10 @@ User gender: {gender}"""
     max_w = round(req.width * 100 * 0.4, 1)
     max_d = round(req.length * 100 * 0.35, 1)
 
+    # Use cached metadata
+    available_styles = ", ".join(f'"{s}"' for s in _cached_styles)
+    available_categories = ", ".join(f'"{c}"' for c in _cached_categories)
+
     return f"""You are an interior design AI assistant.
 Return ONLY a valid JSON object, no explanation, no markdown, no code fences.
 
@@ -54,7 +97,11 @@ Return this exact JSON structure:
     "styles": ["Modern"],
     "colorHexRange": ["#hex1", "#hex2"],
     "colorTone": "warm",
-    "categories": ["Sofa", "Ban", "Ghe"],
+    "categories": [
+        {{ "category": "Sofa", "reasoning": "A sofa is essential for a living room."}},
+        {{ "category": "Bàn", "reasoning": "A coffee table complements the sofa."}},
+        {{ "category": "Ghế", "reasoning": "An armchair provides extra seating."}}
+    ],
     "maxProductWidth": {max_w},
     "maxProductDepth": {max_d},
     "furnitureDensityHint": "{furniture_density}"
@@ -63,58 +110,25 @@ Return this exact JSON structure:
 }}
 
 RULES:
-- styles must be from: ["Modern", "Minimalist", "Classic", "Scandinavian", "Industrial", "Bohemian", "Rustic"]
+- room_type must be one of: "Living Room", "Bedroom".
+- styles must be from this dynamic list: [{available_styles}]
+- categories must be from this dynamic list of Vietnamese names: [{available_categories}]
 - colorTone must be one of: warm, cool, neutral
 - lightingType must be one of: natural, artificial, mixed
 - furnitureDensityHint must be one of: sparse, medium, dense
+- Based on 'furnitureDensity', adjust the number of 'categories' recommended:
+  - "sparse": Recommend 2-3 essential furniture categories.
+  - "medium": Recommend 4-6 core furniture categories.
+  - "dense": Recommend 7-10 furniture categories, including accessories and decor items.
 - maxProductWidth = {max_w}
 - maxProductDepth = {max_d}
-- categories use these Vietnamese names: Sofa, Ghế, Bàn, Giường, Tủ, Kệ, Đèn
+- Each category in the list must have a brief 'reasoning' in Vietnamese.
+- If 'User age' is provided, tailor recommendations:
+  - Ages 10-25: Prefer vibrant, trendy styles (e.g., Bohemian, Modern, Tropical Modern) and brighter, more saturated color palettes.
+  - Ages 26-45: Offer a balanced mix of contemporary and timeless styles (e.g., Scandinavian, Mid-Century, Japandi) with versatile color schemes.
+  - Ages 46+: Suggest classic, comfortable, and elegant styles (e.g., Classic, Rustic, Haussmannian) with more neutral or muted color palettes and accessible furniture (e.g., lower beds, supportive chairs).
 - Return ONLY the JSON, nothing else
 """
-
-
-def _fallback_analysis(req: RecommendRequest) -> GeminiAnalysisResult:
-    style_map = {
-        "modern": ["Modern", "Minimalist"],
-        "minimalist": ["Minimalist", "Scandinavian"],
-        "classic": ["Classic"],
-        "scandinavian": ["Scandinavian", "Minimalist"],
-        "industrial": ["Industrial", "Modern"],
-        "bohemian": ["Bohemian", "Rustic"],
-        "rustic": ["Rustic", "Bohemian"],
-    }
-    styles = style_map.get(req.style.strip().lower(), ["Modern"])
-
-    room_category_map = {
-        "living room": ["Sofa", "Bàn", "Ghế", "Kệ", "Đèn"],
-        "bedroom": ["Giường", "Tủ", "Đèn", "Kệ"],
-        "dining room": ["Bàn", "Ghế", "Đèn"],
-        "office": ["Bàn", "Ghế", "Kệ", "Đèn"],
-        "kitchen": ["Bàn", "Ghế", "Tủ"],
-    }
-    categories = room_category_map.get(req.room_type.lower(), ["Sofa", "Bàn", "Ghế"])
-
-    return GeminiAnalysisResult(
-        imageAnalysis={
-            "dominantColors": ["#F5F5F5", "#E0D5C5", "#8B7355"],
-            "colorTone": "neutral",
-            "detectedStyle": req.style.strip().lower(),
-            "lightingType": "natural",
-            "existingFurnitureCategories": [],
-        },
-        recommendedFilter={
-            "styles": styles,
-            "colorHexRange": ["#F5F5F5", "#E0D5C5"],
-            "colorTone": "neutral",
-            "categories": categories,
-            "maxProductWidth": round(req.width * 100 * 0.4, 1),
-            "maxProductDepth": round(req.length * 100 * 0.35, 1),
-            "furnitureDensityHint": req.furniture_density.value,
-        },
-        reasoning=f"Fallback analysis for {req.style.strip()} {req.room_type} "
-                  f"({req.width}m x {req.length}m).",
-    )
 
 
 async def analyze_room(
@@ -127,8 +141,8 @@ async def analyze_room(
     print(f"[Gemini] API KEY loaded: {'YES' if GEMINI_API_KEY else 'NO - MISSING!'}")
 
     if not GEMINI_API_KEY:
-        print("[Gemini] No API key — using fallback")
-        return _fallback_analysis(req)
+        print("[Gemini] No API key, cannot proceed with analysis.")
+        raise HTTPException(status_code=503, detail="AI service is not configured.")
 
     prompt_text = _build_prompt(req)
 
@@ -186,8 +200,9 @@ async def analyze_room(
         except Exception as exc:
             print(f"[Gemini] Error attempt {attempt + 1}: {exc}")
             if attempt == 2:
-                print("[Gemini] All retries failed — using fallback")
-                return _fallback_analysis(req)
+                print("[Gemini] All retries failed.")
+                raise HTTPException(status_code=503, detail="AI analysis service failed after multiple retries.")
             await asyncio.sleep(5)
 
-    return _fallback_analysis(req)
+    # This part should ideally not be reached if the loop logic is correct.
+    raise HTTPException(status_code=500, detail="An unexpected error occurred in the AI analysis service.")

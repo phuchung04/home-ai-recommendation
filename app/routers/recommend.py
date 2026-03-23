@@ -11,11 +11,9 @@ from fastapi.responses import JSONResponse
 
 from app.models.schemas import RecommendRequest, RecommendResponse, FurnitureDensity, Gender
 from app.services.gemini_service import analyze_room
-from app.services.mongo_service import get_recommendations, get_recommendations_mock
+from app.services.mongo_service import get_recommendations
 
 router = APIRouter()
-
-USE_MOCK_DB = os.getenv("USE_MOCK_DB", "false").lower() == "true"
 
 
 @router.post("/recommend", response_model=RecommendResponse)
@@ -63,12 +61,9 @@ async def recommend_furniture(
 
     # 4. MongoDB query + semantic ranking
     try:
-        if USE_MOCK_DB:
-            products, total_candidates = await get_recommendations_mock(analysis)
-        else:
-            products, total_candidates = await get_recommendations(
-                analysis, user_id=req.user_id, top_n=20
-            )
+        products, total_candidates = await get_recommendations(
+            analysis, user_id=req.user_id, top_n=20
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database query failed: {exc}")
 

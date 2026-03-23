@@ -65,10 +65,15 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
 
     # Case-insensitive regex for styles
     style_patterns = [re.compile(f"^{s}$", re.IGNORECASE) for s in rf.styles]
+    
+    # Extract category names from the new structure
+    category_names = [c.category for c in rf.categories]
 
     query = {
-        "styles": {"$in": style_patterns},
-        "category": {"$in": rf.categories},
+        "$or": [
+            {"styles": {"$in": style_patterns}},
+            {"category": {"$in": category_names}},
+        ],
         "dimensions.width": {"$lte": rf.maxProductWidth},
         "dimensions.depth": {"$lte": rf.maxProductDepth},
     }
@@ -95,6 +100,9 @@ async def get_recommendations(
     rf = analysis.recommendedFilter
     target_colors = rf.colorHexRange
     target_styles_lower = {s.lower() for s in rf.styles}
+    
+    # Create a map from category name to reasoning
+    category_reasoning_map = {c.category: c.reasoning for c in rf.categories}
 
     cursor = col.find(query).limit(candidate_limit)
     
@@ -168,17 +176,25 @@ async def get_recommendations(
             height=dim_raw.get("height"),
         ) if dim_raw else None
 
+        product_category = doc.get("category", "")
+        reasoning = category_reasoning_map.get(product_category, "Sản phẩm này là một lựa chọn phù hợp.")
+
+        # Handle image URL
+        images_list = doc.get("images", [])
+        image_url = images_list[0] if images_list else None
+
         candidates.append(Product(
             id=data["product_id"],
             name=doc.get("name", ""),
-            category=doc.get("category", ""),
+            category=product_category,
             styles=data["prod_styles"],
             price=doc.get("price"),
             dimensions=dims,
             colors=data["prod_colors"],
-            imageUrl=doc.get("imageUrl"),
+            imageUrl=image_url,
             color_distance=round(data["color_dist"], 2),
             ranking_score=round(ranking_score, 4),
+            reasoning=reasoning,
         ))
 
     total_candidates = len(candidates)
@@ -188,94 +204,21 @@ async def get_recommendations(
     return ranked[:top_n], total_candidates
 
 
-# ── Mock data for local development (no MongoDB needed) ─────────────────────
 
-MOCK_PRODUCTS = [
-    {
-        "_id": "p001", "name": "Nordic Sofa L-Shape", "category": "Sofa",
-        "styles": ["Scandinavian", "Modern"], "price": 12500000,
-        "dimensions": {"width": 240, "depth": 160, "height": 85},
-        "colors": ["#F5F5F5", "#E0D5C5"], "imageUrl": "https://example.com/sofa1.jpg",
-    },
-    {
-        "_id": "p002", "name": "Minimalist Coffee Table", "category": "Bàn",
-        "styles": ["Minimalist"], "price": 3200000,
-        "dimensions": {"width": 100, "depth": 50, "height": 45},
-        "colors": ["#8B7355", "#5C4A32"], "imageUrl": "https://example.com/table1.jpg",
-    },
-    {
-        "_id": "p003", "name": "Modern Armchair", "category": "Ghế",
-        "styles": ["Modern"], "price": 4800000,
-        "dimensions": {"width": 80, "depth": 75, "height": 90},
-        "colors": ["#2C2C2C", "#FFFFFF"], "imageUrl": "https://example.com/chair1.jpg",
-    },
-    {
-        "_id": "p004", "name": "Oak Bookshelf", "category": "Kệ",
-        "styles": ["Scandinavian"], "price": 5500000,
-        "dimensions": {"width": 90, "depth": 30, "height": 180},
-        "colors": ["#D4A96A", "#8B6914"], "imageUrl": "https://example.com/shelf1.jpg",
-    },
-    {
-        "_id": "p005", "name": "Industrial Pendant Light", "category": "Đèn",
-        "styles": ["Industrial"], "price": 1200000,
-        "dimensions": {"width": 30, "depth": 30, "height": 40},
-        "colors": ["#2C2C2C", "#B8860B"], "imageUrl": "https://example.com/lamp1.jpg",
-    },
-]
+# ── Metadata retrieval ─────────────────────────────────────────────────────
+
+async def get_distinct_categories() -> List[str]:
+    """Returns a sorted list of unique 'category' values from the collection."""
+    db = get_client()[DB_NAME]
+    col = db[COLLECTION]
+    categories = await col.distinct("category")
+    return sorted([c for c in categories if c])
 
 
-async def get_recommendations_mock(
-    analysis: GeminiAnalysisResult,
-    top_n: int = 20,
-) -> tuple[List[Product], int]:
-    """Mock version for development using the same weighted ranking."""
-    rf = analysis.recommendedFilter
-    target_colors = rf.colorHexRange
-    target_styles_lower = {s.lower() for s in rf.styles}
-    candidates = []
-    max_color_dist = 441.67
+async def get_distinct_styles() -> List[str]:
+    """Returns a sorted list of unique 'styles' values from the collection."""
+    db = get_client()[DB_NAME]
+    col = db[COLLECTION]
+    styles = await col.distinct("styles")
+    return sorted([s for s in styles if s])
 
-    for doc in MOCK_PRODUCTS:
-        # Hard filter mock data
-        prod_styles_lower = {s.lower() for s in doc["styles"]}
-        if not target_styles_lower.intersection(prod_styles_lower):
-            continue
-        if doc["category"] not in rf.categories:
-            continue
-        if doc["dimensions"]["width"] > rf.maxProductWidth:
-            continue
-        if doc["dimensions"]["depth"] > rf.maxProductDepth:
-            continue
-
-        # --- Scoring ---
-        style_match_score = min(
-            len(target_styles_lower.intersection(prod_styles_lower)) /
-            (len(target_styles_lower) or 1), 1.0
-        )
-        color_dist = _min_color_distance(doc["colors"], target_colors)
-        color_score = 1.0 - (color_dist / max_color_dist)
-        in_stock_score = 1.0 if doc.get("inStock", True) else 0.0
-
-        ranking_score = (
-            (style_match_score * 0.5) +
-            (color_score * 0.3) +
-            (in_stock_score * 0.2)
-        )
-
-        dims = ProductDimensions(**doc["dimensions"])
-        candidates.append(Product(
-            id=doc["_id"],
-            name=doc["name"],
-            category=doc["category"],
-            styles=doc["styles"],
-            price=doc["price"],
-            dimensions=dims,
-            colors=doc["colors"],
-            imageUrl=doc["imageUrl"],
-            color_distance=round(color_dist, 2),
-            ranking_score=round(ranking_score, 4),
-        ))
-
-    # Sort by descending ranking score
-    ranked = sorted(candidates, key=lambda p: p.ranking_score or 0, reverse=True)
-    return ranked[:top_n], len(candidates)
