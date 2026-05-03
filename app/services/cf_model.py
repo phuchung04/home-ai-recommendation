@@ -5,6 +5,8 @@ Lưu model để dùng cho real-time scoring.
 """
 import os
 import pickle
+import json
+from datetime import datetime, timezone
 import numpy as np
 import implicit
 from scipy.sparse import csr_matrix
@@ -12,6 +14,7 @@ from typing import Dict, Optional, List, Tuple
 
 MODEL_PATH = os.getenv("CF_MODEL_PATH", "app/models/saved/cf_model.pkl")
 INDEX_PATH = os.getenv("CF_INDEX_PATH", "app/models/saved/cf_index.pkl")
+METADATA_PATH = os.getenv("CF_META_PATH", "app/models/saved/cf_model_meta.json")
 
 # ALS hyperparameters
 ALS_FACTORS = 50        # số latent factors
@@ -47,18 +50,41 @@ def train_model(
     item_user_matrix = user_item_matrix.T.tocsr()
     model.fit(item_user_matrix)
 
-    # Lưu model và index
+    # Lưu model và index (atomic)
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
+
+    # Atomic write model
+    tmp_model = MODEL_PATH + ".tmp"
+    with open(tmp_model, "wb") as f:
         pickle.dump(model, f)
-    with open(INDEX_PATH, "wb") as f:
+    os.replace(tmp_model, MODEL_PATH)
+
+    # Atomic write index
+    tmp_index = INDEX_PATH + ".tmp"
+    with open(tmp_index, "wb") as f:
         pickle.dump({
             "user_index": user_index,
             "item_index": item_index,
             "item_index_reverse": {v: k for k, v in item_index.items()}
         }, f)
+    os.replace(tmp_index, INDEX_PATH)
 
-    print(f"[CF] Model saved to {MODEL_PATH}")
+    # Write metadata for easier inspection (atomic)
+    meta = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "num_users": len(user_index),
+        "num_items": len(item_index),
+        "num_interactions": int(user_item_matrix.nnz),
+        "model_path": MODEL_PATH,
+        "index_path": INDEX_PATH,
+        "source_db": os.getenv("MONGO_URI", ""),
+    }
+    tmp_meta = METADATA_PATH + ".tmp"
+    with open(tmp_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_meta, METADATA_PATH)
+
+    print(f"[CF] Model saved to {MODEL_PATH} (users={len(user_index)}, items={len(item_index)})")
     return model
 
 
@@ -76,7 +102,19 @@ def load_model() -> bool:
             _user_index = idx["user_index"]
             _item_index = idx["item_index"]
             _item_index_reverse = idx["item_index_reverse"]
-        print(f"[CF] Model loaded: {len(_user_index)} users, {len(_item_index)} items")
+        # Try to read metadata if present
+        meta_info = None
+        try:
+            if os.path.exists(METADATA_PATH):
+                with open(METADATA_PATH, "r", encoding="utf-8") as mf:
+                    meta_info = json.load(mf)
+        except Exception:
+            meta_info = None
+
+        if meta_info:
+            print(f"[CF] Model loaded: {meta_info.get('num_users')} users, {meta_info.get('num_items')} items (saved_at={meta_info.get('saved_at')})")
+        else:
+            print(f"[CF] Model loaded: {len(_user_index)} users, {len(_item_index)} items")
         return True
     except Exception as e:
         print(f"[CF] Failed to load model: {e}")

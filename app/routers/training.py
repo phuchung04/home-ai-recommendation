@@ -82,7 +82,17 @@ async def trigger_training():
 def model_status():
     """Kiểm tra trạng thái model hiện tại."""
     import os
-    from app.services.cf_model import MODEL_PATH, _model, _user_index, _item_index
+    from app.services.cf_model import MODEL_PATH, METADATA_PATH, _model, _user_index, _item_index
+
+    meta = None
+    try:
+        if os.path.exists(METADATA_PATH):
+            import json
+            with open(METADATA_PATH, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+    except Exception:
+        meta = None
+
     return {
         "training_status": _train_status,
         "training_started_at": _train_started_at,
@@ -92,4 +102,5 @@ def model_status():
         "model_file_exists": os.path.exists(MODEL_PATH),
         "num_users": len(_user_index),
         "num_items": len(_item_index),
+        "last_saved_metadata": meta,
     }
