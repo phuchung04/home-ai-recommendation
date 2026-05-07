@@ -176,9 +176,13 @@ async def analyze_room(
         "generationConfig": {
             "temperature": 0.1,
             "maxOutputTokens": 4096,
-            "responseMimeType": "application/json",  # ✅ ép Gemini trả JSON thuần
         },
     }
+
+    print(f"[Gemini] Request URL: {GEMINI_URL}")
+    print(f"[Gemini] Payload parts count: {len(parts)}")
+    if image_bytes:
+        print(f"[Gemini] Image included, size: {len(image_bytes)} bytes")
 
     for attempt in range(3):
         try:
@@ -194,6 +198,11 @@ async def analyze_room(
                     print(f"[Gemini] Rate limited (attempt {attempt + 1}/3), waiting {wait}s...")
                     await asyncio.sleep(wait)
                     continue
+
+                if resp.status_code == 400:
+                    error_detail = resp.text[:300] if resp.text else "Bad Request"
+                    print(f"[Gemini] HTTP 400 error: {error_detail}")
+                    raise HTTPException(status_code=400, detail=f"Invalid Gemini request: {error_detail[:100]}")
 
                 resp.raise_for_status()
                 data = resp.json()
