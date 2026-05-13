@@ -5,6 +5,7 @@ gemini_service.py
 import os
 import json
 import base64
+import math
 import httpx
 import asyncio
 import time
@@ -127,6 +128,282 @@ def _dedupe_normalized_labels(values: List[str]) -> List[str]:
     return result
 
 
+def _normalize_room_type_key(room_type: str) -> str:
+    if not isinstance(room_type, str):
+        return "living room"
+
+    normalized = " ".join(room_type.split()).strip().casefold()
+    if "bed" in normalized:
+        return "bedroom"
+    return "living room"
+
+
+def _get_room_area_m2(req: RecommendRequest) -> float:
+    if req.area_m2 and req.area_m2 > 0:
+        return round(float(req.area_m2), 2)
+    return round(req.width * req.length, 2)
+
+
+def _adjust_density_for_area(area_m2: float, density: str) -> tuple[str, Optional[str]]:
+    density_value = density if isinstance(density, str) else str(density)
+    density_key = density_value.strip().casefold()
+
+    if area_m2 < 6:
+        applied = "sparse"
+    elif area_m2 < 8:
+        applied = "sparse" if density_key in {"medium", "dense"} else density_value
+    else:
+        applied = density_value
+
+    warning = None
+    if applied != density_value:
+        warning = f"Diện tích phòng {area_m2}m² quá nhỏ, mật độ nội thất đã được điều chỉnh từ {density_value} sang {applied}."
+
+    return applied, warning
+
+
+def _pick_prompt_categories(req: RecommendRequest, limit: int = 15) -> List[str]:
+    room_key = _normalize_room_type_key(req.room_type.value if hasattr(req.room_type, "value") else str(req.room_type))
+    requested_style = _normalize_catalog_label(req.style)
+
+    if room_key == "bedroom":
+        preferred = [
+            "Giường",
+            "Bàn đầu giường",
+            "Tủ",
+            "Tủ lưu trữ",
+            "Đèn trang trí",
+            "Gương",
+            "Ghế",
+            "Kệ",
+            "Thảm",
+            "Đồ trang trí",
+            "Hàng trang trí",
+            "Hàng trang trí khác",
+            "Chậu hoa",
+            "Hoa & Cây",
+            "Bình trang trí",
+            "Tượng trang trí",
+            "Bàn trang điểm",
+            "Giỏ lưu trữ",
+            "Hộp lưu trữ",
+            "Giá treo quần áo",
+            "Đệm ngồi",
+            "Ghế lười",
+            "Nệm",
+            "Gối",
+            "Tinh dầu",
+            "Đồ nội thất",
+        ]
+    else:
+        preferred = [
+            "Sofa",
+            "Sofa góc",
+            "Bàn nước",
+            "Bàn bên",
+            "Bàn console",
+            "Bàn",
+            "Bàn ăn",
+            "Bàn làm việc",
+            "Tủ tivi",
+            "Tủ lưu trữ",
+            "Tủ ly",
+            "Tủ âm tường",
+            "Kệ phòng khách",
+            "Kệ lưu trữ",
+            "Kệ sách",
+            "Đèn trang trí",
+            "Gương",
+            "Thảm",
+            "Armchair",
+            "Ghế thư giãn",
+            "Ghế dài & đôn",
+            "Ghế lười",
+            "Ghế làm việc",
+            "Ghế ăn",
+            "Hoa & Cây",
+            "Chậu hoa",
+            "Bình trang trí",
+            "Tượng trang trí",
+            "Hàng trang trí",
+            "Hàng trang trí khác",
+            "Phụ kiện nội thất",
+            "Xe đẩy",
+            "Tinh dầu",
+            "Đồ nội thất",
+        ]
+
+    category_aliases = {
+        "armchair": "Armchair",
+        "ghế thư giãn": "Armchair",
+        "couch": "Sofa",
+        "sectional": "Sofa góc",
+        "coffee table": "Bàn nước",
+        "side table": "Bàn bên",
+        "console table": "Bàn console",
+        "table": "Bàn",
+        "dining table": "Bàn ăn",
+        "working desk": "Bàn làm việc",
+        "desk": "Bàn làm việc",
+        "tv stand": "Tủ tivi",
+        "display cabinet": "Tủ ly",
+        "built in cabinet": "Tủ âm tường",
+        "floor lamp": "Đèn trang trí",
+        "đèn": "Đèn trang trí",
+        "lamp": "Đèn trang trí",
+        "storage cabinet": "Tủ lưu trữ",
+        "shelf": "Kệ lưu trữ",
+        "bookshelf": "Kệ sách",
+        "mirror": "Gương",
+        "rug": "Thảm",
+        "plant": "Hoa & Cây",
+        "plant pot": "Chậu hoa",
+        "ottoman": "Ghế dài & đôn",
+        "chair": "Ghế",
+        "nightstand": "Bàn đầu giường",
+        "bedside lamp": "Đèn trang trí",
+        "wardrobe": "Tủ lưu trữ",
+        "dresser": "Bàn trang điểm",
+        "bed": "Giường",
+        "mattress": "Nệm",
+        "pillow": "Gối",
+        "storage box": "Hộp lưu trữ",
+        "clothes rack": "Giá treo quần áo",
+        "decor": "Hàng trang trí",
+        "decor item": "Hàng trang trí khác",
+        "ornament": "Tượng trang trí",
+        "vase": "Bình trang trí",
+        "essential": "Đồ nội thất",
+        "furniture": "Đồ nội thất",
+        "home decor": "Hàng trang trí",
+        "indoor plant": "Hoa & Cây",
+        "cart": "Xe đẩy",
+    }
+
+    cached_lookup = {category.casefold(): category for category in _cached_categories}
+    selected: List[str] = []
+
+    for category in preferred:
+        alias = category_aliases.get(category.casefold(), category)
+        cached_category = cached_lookup.get(alias.casefold()) or cached_lookup.get(category.casefold())
+        selected.append(cached_category or alias)
+
+    if requested_style and len(selected) < limit:
+        selected.extend([style for style in _cached_styles if style.casefold() != requested_style.casefold()][:2])
+
+    return _dedupe_normalized_labels(selected)[:limit]
+
+
+def _build_response_schema() -> dict:
+    return {
+        "type": "object",
+        "required": ["imageAnalysis", "recommendedFilter", "reasoning"],
+        "properties": {
+            "imageAnalysis": {
+                "type": "object",
+                "required": [
+                    "dominantColors",
+                    "colorTone",
+                    "detectedStyle",
+                    "lightingType",
+                    "existingFurnitureCategories",
+                ],
+                "properties": {
+                    "dominantColors": {"type": "array", "items": {"type": "string"}},
+                    "colorTone": {"type": "string"},
+                    "detectedStyle": {"type": "string"},
+                    "lightingType": {"type": "string"},
+                    "existingFurnitureCategories": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "recommendedFilter": {
+                "type": "object",
+                "required": [
+                    "styles",
+                    "colorHexRange",
+                    "colorTone",
+                    "categories",
+                    "roomType",
+                    "maxProductWidth",
+                    "maxProductDepth",
+                    "maxProductArea",
+                    "furnitureDensityHint",
+                ],
+                "properties": {
+                    "styles": {"type": "array", "items": {"type": "string"}},
+                    "colorHexRange": {"type": "array", "items": {"type": "string"}},
+                    "colorTone": {"type": "string"},
+                    "categories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["category", "reasoning", "styleAlignment", "suggestedColorHex", "materialHint"],
+                            "properties": {
+                                "category": {"type": "string"},
+                                "reasoning": {"type": "string"},
+                                "styleAlignment": {"type": "string"},
+                                "suggestedColorHex": {"type": "string"},
+                                "materialHint": {"type": "string"},
+                            },
+                        },
+                    },
+                    "roomType": {"type": "string"},
+                    "roomAreaM2": {"type": ["number", "null"]},
+                    "maxProductWidth": {"type": "number"},
+                    "maxProductDepth": {"type": "number"},
+                    "maxProductArea": {"type": "number"},
+                    "furnitureDensityHint": {"type": "string"},
+                },
+            },
+            "reasoning": {
+                "type": "object",
+                "required": ["styleJustification", "colorJustification", "densityJustification", "userProfileNote"],
+                "properties": {
+                    "styleJustification": {"type": "string"},
+                    "colorJustification": {"type": "string"},
+                    "densityJustification": {"type": "string"},
+                    "userProfileNote": {"type": "string"},
+                },
+            },
+            "warning": {"type": ["string", "null"]},
+            "densityApplied": {"type": ["string", "null"]},
+        },
+    }
+
+
+def _recover_truncated_json_text(raw_text: str) -> str:
+    text = raw_text.strip()
+    if not text:
+        return text
+
+    end = text.rfind("}")
+    while end > 0:
+        candidate = text[: end + 1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            end = candidate[:-1].rfind("}")
+
+    return text
+
+
+def _ensure_analysis_defaults(parsed: dict, req: RecommendRequest) -> dict:
+    if not isinstance(parsed, dict):
+        return parsed
+
+    room_area_m2 = _get_room_area_m2(req)
+    max_product_area = round(room_area_m2 * 10000 * 0.10, 1)
+
+    recommended_filter = parsed.get("recommendedFilter")
+    if isinstance(recommended_filter, dict):
+        recommended_filter.setdefault("roomType", req.room_type.value if hasattr(req.room_type, "value") else str(req.room_type))
+        recommended_filter.setdefault("roomAreaM2", room_area_m2)
+        recommended_filter.setdefault("maxProductArea", max_product_area)
+
+    return parsed
+
+
 def _pick_fallback_styles(req: RecommendRequest) -> List[str]:
     styles: List[str] = []
     requested_style = _normalize_catalog_label(req.style)
@@ -172,9 +449,12 @@ def _pick_fallback_categories(req: RecommendRequest) -> List[str]:
 def _build_fallback_analysis(req: RecommendRequest) -> GeminiAnalysisResult:
     width_cm = round(req.width * 100 * 0.4, 1)
     depth_cm = round(req.length * 100 * 0.35, 1)
+    room_area_m2 = _get_room_area_m2(req)
+    density_applied, warning = _adjust_density_for_area(room_area_m2, req.furniture_density.value)
     fallback_styles = _pick_fallback_styles(req)
-    fallback_categories = _pick_fallback_categories(req)
+    fallback_categories = _pick_prompt_categories(req)
     room_type_value = req.room_type.value if hasattr(req.room_type, "value") else str(req.room_type)
+    max_area_cm2 = round(room_area_m2 * 10000 * 0.10, 1)
 
     if req.age is not None and req.age <= 25:
         user_profile_note = "Người dùng trẻ nên ưu tiên bố cục gọn, màu sáng và vật liệu dễ phối để giữ không gian năng động."
@@ -207,8 +487,11 @@ def _build_fallback_analysis(req: RecommendRequest) -> GeminiAnalysisResult:
                 }
                 for category in fallback_categories
             ],
+            "roomType": room_type_value,
+            "roomAreaM2": room_area_m2,
             "maxProductWidth": width_cm,
             "maxProductDepth": depth_cm,
+            "maxProductArea": max_area_cm2,
             "furnitureDensityHint": req.furniture_density.value,
         },
         reasoning={
@@ -217,6 +500,8 @@ def _build_fallback_analysis(req: RecommendRequest) -> GeminiAnalysisResult:
             "densityJustification": f"Giới hạn kích thước được suy từ kích thước phòng và mật độ '{req.furniture_density.value}' để tránh đề xuất đồ quá lớn.",
             "userProfileNote": user_profile_note,
         },
+        warning=warning,
+        densityApplied=density_applied,
     )
 
 async def load_metadata():
@@ -258,10 +543,15 @@ def _build_prompt(req: RecommendRequest) -> str:
     style = req.style.replace('"', '\\"')
     furniture_density = req.furniture_density.value.replace('"', '\\"')
     gender = req.gender.value.replace('"', '\\"')
+    room_area_m2 = _get_room_area_m2(req)
+    density_applied, warning = _adjust_density_for_area(room_area_m2, req.furniture_density.value)
+    prompt_categories = _pick_prompt_categories(req)
+    room_type_value = req.room_type.value if hasattr(req.room_type, "value") else str(req.room_type)
 
     user_input = f"""Room type: {room_type}
 Desired style: {style}
 Room dimensions: {req.width}m x {req.length}m x {req.height}m
+Room area: {room_area_m2}m²
 Furniture density: {furniture_density}
 User gender: {gender}"""
     if req.age:
@@ -269,10 +559,11 @@ User gender: {gender}"""
 
     max_w = round(req.width * 100 * 0.4, 1)
     max_d = round(req.length * 100 * 0.35, 1)
+    max_area_cm2 = round(room_area_m2 * 10000 * 0.10, 1)
 
     # Use cached metadata
     available_styles = ", ".join(f'"{s}"' for s in _cached_styles)
-    available_categories = ", ".join(f'"{c}"' for c in _cached_categories)
+    available_categories = ", ".join(f'"{c}"' for c in prompt_categories)
 
     return f"""You are an expert interior design AI assistant specializing in Vietnamese home decor.
 Return ONLY a valid JSON object. No explanation, no markdown, no code fences.
@@ -305,6 +596,8 @@ Analyze the room context and user profile, then recommend the most suitable furn
         "materialHint": "vải chenille hoặc da tổng hợp"
       }}
     ],
+        "roomType": "{room_type_value}",
+        "roomAreaM2": {room_area_m2},
     "maxProductWidth": {max_w},
     "maxProductDepth": {max_d},
     "furnitureDensityHint": "{furniture_density}"
@@ -333,9 +626,22 @@ Analyze the room context and user profile, then recommend the most suitable furn
 - "medium" → 4-6 danh mục cốt lõi
 - "dense" → 7-10 danh mục bao gồm phụ kiện trang trí
 
+### Room-based category filtering
+- Chỉ đưa vào prompt những category phù hợp với room type hiện tại.
+- Bedroom chỉ ưu tiên các category liên quan đến ngủ, lưu trữ cá nhân và ánh sáng đầu giường.
+- Living Room chỉ ưu tiên các category liên quan đến ngồi, bàn phụ, lưu trữ và chiếu sáng sinh hoạt.
+- Nếu room area <= 8m², giữ prompt ngắn hơn và ưu tiên category thiết yếu.
+
+### Small-room behavior
+- Nếu room area <= 6m², ưu tiên sản phẩm compact, đa năng và tránh món chiếm nhiều mặt sàn.
+- Món nào có footprint lớn hơn {max_area_cm2} cm² phải bị loại khỏi kết quả.
+
 ### Dimension constraints
 - maxProductWidth = {max_w} cm
 - maxProductDepth = {max_d} cm
+- densityApplied = {density_applied}
+- warning = {warning or "None"}
+- maxProductArea = {max_area_cm2} cm²
 
 ### Reasoning quality (MANDATORY — minimum 2 sentences per category)
 1. Tại sao item này phù hợp với style đã chọn, phải nhắc ít nhất 1 đặc điểm thiết kế cụ thể của chính category đó.
@@ -462,8 +768,18 @@ async def analyze_room(
             # Clean JSON
             clean = _extract_json_text(raw_text)
 
-            parsed = json.loads(clean)
+            try:
+                parsed = json.loads(clean)
+            except json.JSONDecodeError as parse_error:
+                print(f"[Gemini] JSON parse failed: {parse_error}")
+                recovered = _recover_truncated_json_text(clean)
+                if recovered != clean:
+                    print(f"[Gemini] Retrying parse with recovered JSON tail, length={len(recovered)}")
+                    parsed = json.loads(recovered)
+                else:
+                    raise
             parsed = _normalize_gemini_response(parsed)
+            parsed = _ensure_analysis_defaults(parsed, req)
 
             # Cache parsed result
             _request_cache[cache_key] = (time.time(), parsed)

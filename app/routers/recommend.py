@@ -23,6 +23,7 @@ async def recommend_furniture(
     width: float = Form(..., example=4.5),
     length: float = Form(..., example=6.0),
     height: float = Form(..., example=2.8),
+    area_m2: Optional[float] = Form(None),
     furniture_density: FurnitureDensity = Form(..., example="medium"),
     gender: Gender = Form(..., example="female"),
     age: Optional[int] = Form(None, example=25),
@@ -40,6 +41,7 @@ async def recommend_furniture(
         width=width,
         length=length,
         height=height,
+        area_m2=area_m2,
         furniture_density=furniture_density,
         gender=gender,
         age=age,
@@ -63,7 +65,7 @@ async def recommend_furniture(
 
     # 4. MongoDB query + semantic ranking
     try:
-        products, total_candidates = await get_recommendations(
+        products, total_candidates, warning, density_applied = await get_recommendations(
             analysis, user_id=req.user_id, top_n=20
         )
     except HTTPException:
@@ -76,6 +78,8 @@ async def recommend_furniture(
         products=products,
         total_candidates=total_candidates,
         total_returned=len(products),
+        warning=warning,
+        densityApplied=density_applied,
     )
 
 
@@ -86,6 +90,7 @@ async def analyze_only(
     width: float = Form(...),
     length: float = Form(...),
     height: float = Form(...),
+    area_m2: Optional[float] = Form(None),
     furniture_density: FurnitureDensity = Form(...),
     gender: Gender = Form(...),
     age: Optional[int] = Form(None),
@@ -94,7 +99,7 @@ async def analyze_only(
     """Return only Gemini analysis JSON without product lookup."""
     req = RecommendRequest(
         room_type=room_type, style=style, width=width, length=length,
-        height=height, furniture_density=furniture_density, gender=gender,
+        height=height, area_m2=area_m2, furniture_density=furniture_density, gender=gender,
         age=age,
     )
     image_bytes = None

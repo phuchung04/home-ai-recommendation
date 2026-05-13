@@ -28,6 +28,7 @@ class RecommendRequest(BaseModel):
     width: float = Field(..., ge=2.0, le=10.0, description="Room width in meters (2-10m)", example=4.5)
     length: float = Field(..., ge=2.0, le=12.0, description="Room length in meters (2-12m)", example=6.0)
     height: float = Field(..., ge=2.0, le=4.0, description="Room height in meters (2-4m)", example=2.8)
+    area_m2: Optional[float] = None
     furniture_density: FurnitureDensity = Field(..., example="medium")
     gender: Gender = Field(..., example="female")
     age: Optional[int] = Field(None, gt=0, description="User's age", example=25)
@@ -57,8 +58,11 @@ class RecommendedFilter(BaseModel):
     colorHexRange: List[str]
     colorTone: str
     categories: List[CategoryRecommendation]
+    roomType: str
+    roomAreaM2: Optional[float] = None
     maxProductWidth: float
     maxProductDepth: float
+    maxProductArea: float
     furnitureDensityHint: str
 
 
@@ -110,3 +114,5 @@ class RecommendResponse(BaseModel):
     products: List[Product]
     total_candidates: int
     total_returned: int
+    warning: Optional[str] = None
+    densityApplied: Optional[str] = None
