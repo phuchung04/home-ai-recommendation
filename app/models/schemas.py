@@ -75,6 +75,8 @@ class AnalysisReasoning(BaseModel):
 
 
 class GeminiAnalysisResult(BaseModel):
+    isRoom: bool = True
+    notRoomReason: Optional[str] = None
     imageAnalysis: ImageAnalysis
     recommendedFilter: RecommendedFilter
     reasoning: AnalysisReasoning

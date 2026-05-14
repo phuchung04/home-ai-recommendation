@@ -63,6 +63,16 @@ async def recommend_furniture(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Image analysis failed: {exc}")
 
+    if not analysis.isRoom:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "INVALID_IMAGE",
+                "message": "Ảnh tải lên không phải là hình ảnh căn phòng.",
+                "reason": analysis.notRoomReason or "Không nhận diện được phòng.",
+            },
+        )
+
     # 4. MongoDB query + semantic ranking
     try:
         products, total_candidates, warning, density_applied = await get_recommendations(

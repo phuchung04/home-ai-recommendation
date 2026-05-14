@@ -15,6 +15,7 @@ import itertools
 import threading
 from typing import Optional, List, Dict, Tuple, Any
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from app.models.schemas import RecommendRequest, GeminiAnalysisResult
 from app.services.mongo_service import get_distinct_categories, get_distinct_styles
@@ -354,8 +355,10 @@ def _pick_prompt_categories(req: RecommendRequest, limit: int = 15) -> List[str]
 def _build_response_schema() -> dict:
     return {
         "type": "object",
-        "required": ["imageAnalysis", "recommendedFilter", "reasoning"],
+        "required": ["isRoom", "notRoomReason", "imageAnalysis", "recommendedFilter", "reasoning"],
         "properties": {
+            "isRoom": {"type": "boolean"},
+            "notRoomReason": {"type": ["string", "null"]},
             "imageAnalysis": {
                 "type": "object",
                 "required": [
@@ -449,6 +452,9 @@ def _ensure_analysis_defaults(parsed: dict, req: RecommendRequest) -> dict:
     if not isinstance(parsed, dict):
         return parsed
 
+    parsed.setdefault("isRoom", True)
+    parsed.setdefault("notRoomReason", None)
+
     room_area_m2 = _get_room_area_m2(req)
     max_product_area = round(room_area_m2 * 10000 * 0.10, 1)
 
@@ -458,6 +464,43 @@ def _ensure_analysis_defaults(parsed: dict, req: RecommendRequest) -> dict:
         recommended_filter.setdefault("roomAreaM2", room_area_m2)
         recommended_filter.setdefault("maxProductArea", max_product_area)
 
+    return parsed
+
+
+def _hydrate_non_room_payload(parsed: dict, req: RecommendRequest) -> dict:
+    """
+    Gemini may omit or null nested analysis fields when isRoom=false.
+    Fill required nested objects from fallback so Pydantic validation can pass
+    and router can return a clean 422 INVALID_IMAGE response.
+    """
+    if not isinstance(parsed, dict) or parsed.get("isRoom") is not False:
+        return parsed
+
+    fallback = _build_fallback_analysis(req).model_dump()
+
+    if not isinstance(parsed.get("imageAnalysis"), dict):
+        parsed["imageAnalysis"] = fallback["imageAnalysis"]
+    else:
+        for key, value in fallback["imageAnalysis"].items():
+            if parsed["imageAnalysis"].get(key) is None:
+                parsed["imageAnalysis"][key] = value
+
+    if not isinstance(parsed.get("recommendedFilter"), dict):
+        parsed["recommendedFilter"] = fallback["recommendedFilter"]
+    else:
+        for key, value in fallback["recommendedFilter"].items():
+            if parsed["recommendedFilter"].get(key) is None:
+                parsed["recommendedFilter"][key] = value
+
+    if not isinstance(parsed.get("reasoning"), dict):
+        parsed["reasoning"] = fallback["reasoning"]
+    else:
+        for key, value in fallback["reasoning"].items():
+            if parsed["reasoning"].get(key) is None:
+                parsed["reasoning"][key] = value
+
+    parsed["isRoom"] = False
+    parsed["notRoomReason"] = parsed.get("notRoomReason") or "Không nhận diện được phòng từ ảnh tải lên."
     return parsed
 
 
@@ -523,6 +566,8 @@ def _build_fallback_analysis(req: RecommendRequest) -> GeminiAnalysisResult:
         user_profile_note = "Không có thông tin tuổi nên hệ thống ưu tiên lựa chọn an toàn, dễ phối và phù hợp nhiều ngữ cảnh sử dụng."
 
     return GeminiAnalysisResult(
+        isRoom=True,
+        notRoomReason=None,
         imageAnalysis={
             "dominantColors": ["#F3F0EA", "#D9D5CF", "#A8A29E"],
             "colorTone": "neutral warm",
@@ -629,10 +674,58 @@ Return ONLY a valid JSON object. No explanation, no markdown, no code fences.
 {user_input}
 
 ## TASK
+## STEP 0 -- IMAGE VALIDATION (MANDATORY)
+Run this step before any other analysis. Do NOT skip.
+
+### Task
+Determine whether the uploaded image shows a real or realistically rendered
+INDOOR ROOM SPACE suitable for interior design analysis.
+
+### Classification Rules
+Set "isRoom": true ONLY when the image clearly shows:
+- A real-life interior room (living room, bedroom, kitchen, bathroom,
+    dining room, home office, etc.)
+- A photorealistic 3D render of an interior room
+- A staged showroom or model home interior
+
+Set "isRoom": false when the image shows ANY of the following:
+- A person, animal, or human face
+- An outdoor or semi-outdoor scene (garden, balcony, patio, street)
+- Food, plants, or isolated objects on plain backgrounds
+- Abstract, artistic, or cartoon illustrations
+- A floor plan, blueprint, or top-down schematic
+- A hand-drawn sketch or mood board
+- A single furniture item with no room context
+- An image too dark, blurry, or cropped to identify the space
+
+### Confidence Handling
+If the image is ambiguous (e.g., partially visible room, unusual angle):
+- Set "isRoom": true only if you are >= 80% confident it is an interior room
+- Otherwise set "isRoom": false and explain in "notRoomReason"
+
+### Output Format
+Respond ONLY with a valid JSON object. No explanation outside the JSON.
+
+{{
+    "isRoom": true,
+    "confidence": 0.95,
+    "notRoomReason": null,
+    "roomType": "Living Room"
+}}
+
+### Examples
+- Photo of a living room -> isRoom: true
+- 3D render of a bedroom -> isRoom: true
+- Photo of a cat on a sofa -> isRoom: false ("Image shows a cat, not a room")
+- Floor plan drawing -> isRoom: false ("Image is a floor plan, not a room photo")
+- Very dark blurry image -> isRoom: false ("Image too unclear to identify a room")
+
 Analyze the room context and user profile, then recommend the most suitable furniture categories with detailed reasoning.
 
 ## OUTPUT SCHEMA
 {{
+    "isRoom": true,
+    "notRoomReason": null,
   "imageAnalysis": {{
     "dominantColors": ["#hex1", "#hex2", "#hex3"],
     "colorTone": "warm|cool|neutral",
@@ -668,6 +761,11 @@ Analyze the room context and user profile, then recommend the most suitable furn
 }}
 
 ## STRICT RULES
+
+### STEP 0 output behavior
+- If the uploaded image is not a valid room image, set isRoom=false and provide notRoomReason.
+- If isRoom=false, still return a valid JSON object and keep the output parseable.
+- If isRoom=true, set notRoomReason=null.
 
 ### Schema constraints
 - styles: chỉ dùng từ danh sách: [{available_styles}]
@@ -841,12 +939,25 @@ async def analyze_room(
                     raise
             parsed = _normalize_gemini_response(parsed)
             parsed = _ensure_analysis_defaults(parsed, req)
+            parsed = _hydrate_non_room_payload(parsed, req)
+            result = GeminiAnalysisResult(**parsed)
 
-            # Cache parsed result
-            _request_cache[cache_key] = (time.time(), parsed)
+            # Cache only validated result
+            _request_cache[cache_key] = (time.time(), result.model_dump())
 
             print(f"[Gemini] Success on attempt {attempt + 1}")
-            return GeminiAnalysisResult(**parsed)
+            return result
+
+        except ValidationError as val_exc:
+            print(f"[Gemini] Validation failed on attempt {attempt + 1}: {val_exc}")
+            # Do not rotate all keys for schema-shape failures; return deterministic fallback.
+            if isinstance(locals().get("parsed"), dict) and parsed.get("isRoom") is False:
+                safe_parsed = _hydrate_non_room_payload(parsed, req)
+                safe_result = GeminiAnalysisResult(**safe_parsed)
+                _request_cache[cache_key] = (time.time(), safe_result.model_dump())
+                print("[Gemini] Returned hydrated non-room response after validation mismatch.")
+                return safe_result
+            return _build_fallback_analysis(req)
 
         except httpx.HTTPStatusError as http_exc:
             # If response indicates daily quota exhaustion, blacklist this key and continue
