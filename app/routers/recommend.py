@@ -66,7 +66,7 @@ async def recommend_furniture(
     # 4. MongoDB query + semantic ranking
     try:
         products, total_candidates, warning, density_applied = await get_recommendations(
-            analysis, user_id=req.user_id, top_n=20
+            analysis, user_id=req.user_id, top_n=30
         )
     except HTTPException:
         raise

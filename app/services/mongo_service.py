@@ -117,6 +117,8 @@ def _category_alias(category: str) -> str:
         "console table": "Bàn console",
         "table": "Bàn",
         "dining table": "Bàn ăn",
+        "dining chair": "Ghế ăn",
+        "ghế ăn": "Ghế ăn",
         "working desk": "Bàn làm việc",
         "desk": "Bàn làm việc",
         "tv stand": "Tủ tivi",
@@ -192,7 +194,12 @@ def _get_room_category_tiers(room_type: str, area_m2: Optional[float], density: 
             tier5 = [category for category in tier5 if category not in {"Hàng trang trí", "Hàng trang trí khác"}]
 
     if density_applied == "sparse":
-        tiers = [tier1]
+        if effective_area is not None and effective_area >= 20:
+            # Large room: suggest tier2 as well for balance
+            tiers = [tier1, tier2]
+            warning = (warning or "") + f" Phòng rộng {effective_area}m², đề xuất thêm một số nội thất tier 2 để cân bằng không gian."
+        else:
+            tiers = [tier1]
     elif density_applied == "medium":
         tiers = [tier1, tier2, tier3]
     else:
@@ -221,10 +228,12 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
 
     max_product_area = getattr(rf, "maxProductArea", rf.maxProductWidth * rf.maxProductDepth)
 
+    # Build base query with mandatory category filter
     query = {
+        "category": {"$in": category_names},  # Category is mandatory
         "$or": [
             {"styles": {"$in": style_patterns}},
-            {"category": {"$in": category_names}},
+            {"dimensions.width": {"$lte": rf.maxProductWidth}},
         ],
         "dimensions.width": {"$lte": rf.maxProductWidth},
         "dimensions.depth": {"$lte": rf.maxProductDepth},
@@ -240,6 +249,13 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
             ]
         },
     }
+    
+    # Add hard exclusion for bedroom furniture
+    room_key = _normalize_room_type_key(rf.roomType)
+    if room_key == "bedroom":
+        excluded_categories = ["Ghế ăn", "Bàn ăn", "Sofa", "Sofa góc", "Tủ tivi", "Bàn nước"]
+        query["category"]["$nin"] = excluded_categories
+    
     return query
 
 
@@ -303,7 +319,7 @@ async def get_recommendations(
         style_match_score = min(matching_styles / (len(target_styles_lower) or 1), 1.0)
 
         color_dist = _min_color_distance(prod_colors, target_colors)
-        color_score = 1.0 - (color_dist / max_color_dist)
+        color_score = max(0.0, 1.0 - (color_dist / max_color_dist))  # Clamp to [0, 1]
 
         in_stock_score = 1.0 if is_in_stock else 0.0
 
@@ -350,6 +366,9 @@ async def get_recommendations(
                 (scores["color"] * 0.3) +
                 (scores["stock"] * 0.2)
             )
+        
+        # Ensure ranking_score is never negative
+        ranking_score = max(0.0, ranking_score)
 
         dim_raw = doc.get("dimensions", {})
         dims = ProductDimensions(
