@@ -11,6 +11,8 @@ import asyncio
 import time
 import hashlib
 import random
+import itertools
+import threading
 from typing import Optional, List, Dict, Tuple, Any
 from fastapi import HTTPException
 
@@ -98,6 +100,61 @@ _CACHE_TTL_SECONDS = 60 * 10  # 10 minutes
 
 # Limit concurrent outbound calls to Gemini to avoid bursts
 _gemini_semaphore = asyncio.Semaphore(2)
+
+
+def _load_api_keys() -> list[str]:
+    """Load tất cả Gemini API keys từ environment variables."""
+    keys = []
+    # Key chính
+    primary = os.getenv("GEMINI_API_KEY", "").strip()
+    if primary:
+        keys.append(primary)
+    # Key phụ: GEMINI_API_KEY_2, GEMINI_API_KEY_3, ...
+    i = 2
+    while True:
+        key = os.getenv(f"GEMINI_API_KEY_{i}", "").strip()
+        if not key:
+            break
+        keys.append(key)
+        i += 1
+    return keys
+
+
+class _GeminiKeyPool:
+    """Thread-safe round-robin key pool với blacklist tạm thời khi quota hết."""
+
+    def __init__(self, keys: list[str]):
+        self._keys = keys
+        self._cycle = itertools.cycle(keys) if keys else iter([])
+        self._lock = threading.Lock()
+        self._exhausted: set[str] = set()  # keys bị quota hết
+
+    def next_key(self) -> str | None:
+        with self._lock:
+            available = [k for k in self._keys if k not in self._exhausted]
+            if not available:
+                # Reset blacklist — thử lại tất cả
+                self._exhausted.clear()
+                available = self._keys
+            if not available:
+                return None
+            # Round-robin trên available keys
+            key = next(k for k in self._cycle if k in available)
+            return key
+
+    def mark_exhausted(self, key: str):
+        """Đánh dấu key bị quota hết — không dùng tạm thời."""
+        with self._lock:
+            self._exhausted.add(key)
+            print(f"[KeyPool] Key ...{key[-6:]} marked as exhausted. "
+                  f"Remaining: {len(self._keys) - len(self._exhausted)}")
+
+    @property
+    def has_keys(self) -> bool:
+        return bool(self._keys)
+
+
+_key_pool = _GeminiKeyPool(_load_api_keys())
 
 # ── Metadata Caching ─────────────────────────────────────────────────────────
 
@@ -670,11 +727,8 @@ async def analyze_room(
     image_mime: str = "image/jpeg",
 ) -> GeminiAnalysisResult:
 
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    print(f"[Gemini] API KEY loaded: {'YES' if GEMINI_API_KEY else 'NO - MISSING!'}")
-
-    if not GEMINI_API_KEY:
-        print("[Gemini] No API key, cannot proceed with analysis.")
+    if not _key_pool.has_keys:
+        print("[Gemini] No API keys configured.")
         raise HTTPException(status_code=503, detail="AI service is not configured.")
 
     prompt_text = _build_prompt(req)
@@ -721,8 +775,14 @@ async def analyze_room(
             # expired
             del _request_cache[cache_key]
 
-    max_attempts = 3
-    for attempt in range(max_attempts):
+    # Try keys in round-robin with retries and fallback behavior
+    max_attempts = 3 * len(_key_pool._keys) if _key_pool._keys else 3
+    for attempt in range(max(max_attempts, 3)):
+        current_key = _key_pool.next_key()
+        if not current_key:
+            print("[Gemini] All keys exhausted. Returning fallback.")
+            return _build_fallback_analysis(req)
+
         try:
             # throttle concurrency to avoid bursts
             async with _gemini_semaphore:
@@ -734,22 +794,23 @@ async def analyze_room(
                 )
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     resp = await client.post(
-                        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                        f"{GEMINI_URL}?key={current_key}",
                         json=payload,
                     )
 
             status = getattr(resp, "status_code", None)
-            if status == 429 or status == 503:
-                if status == 429 and _is_daily_quota_exhausted(resp):
-                    print("[Gemini] Daily quota exhausted (RPD). Skipping retries.")
-                    return _build_fallback_analysis(req)
+            if status in (429, 503):
+                if _is_daily_quota_exhausted(resp):
+                    _key_pool.mark_exhausted(current_key)
+                    print(f"[Gemini] Key exhausted, switching to next key...")
+                    continue  # try next key immediately
 
-                # Exponential backoff with jitter
+                # Rate limit / transient upstream problem → retry with backoff
                 if attempt == max_attempts - 1:
                     print("[Gemini] Final retry exhausted. Returning fallback analysis.")
                     return _build_fallback_analysis(req)
 
-                wait = min(15, (2 ** attempt)) + random.uniform(0, 1)
+                wait = min(15, 2 ** (attempt % 3)) + random.uniform(0, 1)
                 print(f"[Gemini] Upstream rate/availability issue (status={status}) attempt {attempt + 1}/{max_attempts}, waiting {wait:.1f}s...")
                 await asyncio.sleep(wait)
                 continue
@@ -788,20 +849,25 @@ async def analyze_room(
             return GeminiAnalysisResult(**parsed)
 
         except httpx.HTTPStatusError as http_exc:
+            # If response indicates daily quota exhaustion, blacklist this key and continue
+            resp_obj = getattr(http_exc, "response", None)
+            if resp_obj and _is_daily_quota_exhausted(resp_obj):
+                _key_pool.mark_exhausted(current_key)
+                print(f"[Gemini] Key marked exhausted from exception, trying next key...")
+                continue
+
             print(f"[Gemini] HTTP status error attempt {attempt + 1}: {http_exc}")
             if attempt == max_attempts - 1:
                 print("[Gemini] All retries failed. Returning fallback analysis.")
                 return _build_fallback_analysis(req)
-            await asyncio.sleep(min(15, 2 ** attempt))
+            await asyncio.sleep(min(15, 2 ** (attempt % 3)))
 
         except Exception as exc:
-            print(f"[Gemini] Error attempt {attempt + 1}: {exc}")
+            print(f"[Gemini] Error with key ...{current_key[-6:]}: {exc}")
             if attempt == max_attempts - 1:
                 print("[Gemini] All retries failed. Returning fallback analysis.")
                 return _build_fallback_analysis(req)
-            # backoff with jitter for non-http errors
-            wait = min(15, 2 ** attempt) + random.uniform(0, 1)
+            wait = min(10, 2 ** (attempt % 3))
             await asyncio.sleep(wait)
 
-    # This part should ideally not be reached if the loop logic is correct.
     return _build_fallback_analysis(req)
