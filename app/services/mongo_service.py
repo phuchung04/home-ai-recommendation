@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 mongo_service.py
 Hard-filter candidates from MongoDB, then rank by color distance.
@@ -8,6 +9,7 @@ import math
 import re
 from typing import List, Optional
 
+# pyrefly: ignore [missing-import]
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.services.cf_model import get_cf_scores, get_user_behavior_count
@@ -239,36 +241,76 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
     to_inject = [c for c in req_cats if c.casefold() not in normalized_names]
     if to_inject:
         category_names = to_inject + category_names
+    
+    # Store original names for later bed-specific query
+    category_names_with_required = category_names
 
     max_product_area = getattr(rf, "maxProductArea", rf.maxProductWidth * rf.maxProductDepth)
 
     # Build base query with mandatory category filter
-    query = {
-        "category": {"$in": category_names},  # Category is mandatory
-        "$or": [
-            {"styles": {"$in": style_patterns}},
-            {"dimensions.width": {"$lte": rf.maxProductWidth}},
-        ],
-        "dimensions.width": {"$lte": rf.maxProductWidth},
-        "dimensions.depth": {"$lte": rf.maxProductDepth},
-        "$expr": {
-            "$lte": [
-                {
-                    "$multiply": [
-                        {"$ifNull": ["$dimensions.width", 0]},
-                        {"$ifNull": ["$dimensions.depth", 0]},
-                    ]
-                },
-                max_product_area,
-            ]
-        },
-    }
-    
-    # Add hard exclusion for bedroom furniture
     room_key = _normalize_room_type_key(rf.roomType)
+    excluded_categories = ["Ghế ăn", "Bàn ăn", "Sofa", "Sofa góc", "Tủ tivi", "Bàn nước"]
+    
+    # Filter category list: include required + remove excluded
+    filtered_categories = [c for c in category_names_with_required if c not in excluded_categories]
+    
     if room_key == "bedroom":
-        excluded_categories = ["Ghế ăn", "Bàn ăn", "Sofa", "Sofa góc", "Tủ tivi", "Bàn nước"]
-        query["category"]["$nin"] = excluded_categories
+        BED_CATS = {"giường", "nệm"}
+        WARDROBE_CATS = {"tủ lưu trữ", "tủ"}
+        
+        bed_cats = [c for c in filtered_categories if _normalize_lookup_key(c) in BED_CATS]
+        wardrobe_cats = [c for c in filtered_categories if _normalize_lookup_key(c) in WARDROBE_CATS]
+        non_large_cats = [c for c in filtered_categories if _normalize_lookup_key(c) not in BED_CATS and _normalize_lookup_key(c) not in WARDROBE_CATS]
+
+        or_clauses = []
+        
+        # Beds/Mattresses: NO dimension filter at all (beds can be any size)
+        if bed_cats:
+            or_clauses.append({"category": {"$in": bed_cats}})
+        
+        # Wardrobes: only width filter
+        if wardrobe_cats:
+            or_clauses.append({
+                "category": {"$in": wardrobe_cats},
+                "$or": [
+                    {"dimensions.width": {"$exists": False}},
+                    {"dimensions.width": None},
+                    {"dimensions.width": {"$lte": rf.maxProductWidth * 1.15}},
+                ]
+            })
+        
+        # Other furniture: full dimension filter
+        if non_large_cats:
+            or_clauses.append({
+                "category": {"$in": non_large_cats},
+                "$or": [
+                    {"dimensions.width": {"$exists": False}},
+                    {"dimensions.width": {"$lte": rf.maxProductWidth * 1.15}},
+                ],
+                "$or": [
+                    {"dimensions.depth": {"$exists": False}},
+                    {"dimensions.depth": {"$lte": rf.maxProductDepth * 1.15}},
+                ],
+            })
+        
+        query = {"$or": or_clauses} if or_clauses else {"category": {"$in": filtered_categories}}
+    else:
+        # Living room: standard strict query
+        query = {
+            "category": {"$in": filtered_categories},
+            "$or": [
+                {"styles": {"$in": style_patterns}},
+                {"dimensions.width": {"$lte": rf.maxProductWidth}},
+            ],
+            "dimensions.width": {"$lte": rf.maxProductWidth},
+            "dimensions.depth": {"$lte": rf.maxProductDepth},
+            "$expr": {
+                "$lte": [
+                    {"$multiply": [{"$ifNull": ["$dimensions.width", 0]}, {"$ifNull": ["$dimensions.depth", 0]}]},
+                    max_product_area,
+                ]
+            },
+        }
     
     return query
 
@@ -278,8 +320,8 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
 async def get_recommendations(
     analysis: GeminiAnalysisResult,
     user_id: str = None,
-    top_n: int = 20,
-    candidate_limit: int = 70,
+    top_n: int = 30,
+    candidate_limit: int = 300,
 ) -> tuple[List[Product], int, Optional[str], Optional[str]]:
     """
     1. Hard-filter up to `candidate_limit` products from MongoDB.
@@ -308,11 +350,11 @@ async def get_recommendations(
     }
 
     if density_applied == "sparse":
-        max_products_per_category = 4
+        max_products_per_category = 6
     elif density_applied == "medium":
-        max_products_per_category = 3
+        max_products_per_category = 5
     else:
-        max_products_per_category = 2
+        max_products_per_category = 4
 
     cursor = col.find(query).limit(candidate_limit)
     
@@ -323,8 +365,13 @@ async def get_recommendations(
 
     async for doc in cursor:
         prod_styles = doc.get("styles", [])
-        color_obj = doc.get("color", {})
-        prod_colors = [color_obj.get("hex")] if color_obj and color_obj.get("hex") else []
+        color_obj = doc.get("color")
+        if isinstance(color_obj, dict):
+            prod_colors = [color_obj.get("hex")] if color_obj.get("hex") else []
+        elif isinstance(color_obj, list):
+            prod_colors = [c.get("hex") for c in color_obj if isinstance(c, dict) and c.get("hex")]
+        else:
+            prod_colors = []
         is_in_stock = doc.get("inStock", True)
 
         # Individual scores
@@ -354,6 +401,58 @@ async def get_recommendations(
             "prod_styles": prod_styles,
             "category_rank": category_rank,
         })
+
+    # If no bed/mattress candidates were found for a bedroom, run a relaxed fallback
+    room_key = _normalize_room_type_key(rf.roomType)
+    if room_key == "bedroom":
+        has_bed = any(
+            _normalize_lookup_key(d.get("doc", {}).get("category", "")) in {"giường", "nệm"}
+            for d in candidate_data
+        )
+        if not has_bed:
+            try:
+                bed_query = {"category": {"$in": ["Giường", "Nệm"]}}
+                # fetch a small number of bed candidates ignoring strict dimension filters
+                bed_cursor = col.find(bed_query).limit(12)
+                async for bdoc in bed_cursor:
+                    b_id = str(bdoc.get("_id", ""))
+                    if b_id in product_ids_for_cf:
+                        continue
+                    b_styles = bdoc.get("styles", [])
+                    b_color_obj = bdoc.get("color")
+                    if isinstance(b_color_obj, dict):
+                        b_colors = [b_color_obj.get("hex")] if b_color_obj.get("hex") else []
+                    elif isinstance(b_color_obj, list):
+                        b_colors = [c.get("hex") for c in b_color_obj if isinstance(c, dict) and c.get("hex")]
+                    else:
+                        b_colors = []
+                    # conservative scoring: style match and color distance computed later
+                    prod_styles_lower = {s.lower() for s in b_styles}
+                    matching_styles = len(target_styles_lower.intersection(prod_styles_lower))
+                    style_match_score = min(matching_styles / (len(target_styles_lower) or 1), 1.0)
+                    color_dist = _min_color_distance(b_colors, target_colors)
+                    color_score = max(0.0, 1.0 - (color_dist / max_color_dist))
+                    in_stock_score = 1.0 if bdoc.get("inStock", True) else 0.0
+
+                    product_ids_for_cf.append(b_id)
+                    category_rank = tier_lookup.get(_normalize_lookup_key(bdoc.get("category", "")), len(room_tiers))
+
+                    candidate_data.append({
+                        "doc": bdoc,
+                        "product_id": b_id,
+                        "scores": {
+                            "style": style_match_score,
+                            "color": color_score,
+                            "stock": in_stock_score,
+                        },
+                        "color_dist": color_dist,
+                        "prod_colors": b_colors,
+                        "prod_styles": b_styles,
+                        "category_rank": category_rank,
+                    })
+            except Exception:
+                # fallback should be best-effort; ignore failures and continue
+                pass
 
     # Step 2: Get Collaborative Filtering scores and adaptive weights
     behavior_count = 0
@@ -532,68 +631,6 @@ async def get_recommendations(
         selected.append(product)
         if len(selected) >= top_n:
             break
-
-    # Guarantee at least one product from required categories for the room type
-    REQUIRED_CATEGORIES = {
-        "bedroom": ["Giường", "Nệm", "Bàn đầu giường"],
-        "living room": ["Sofa", "Sofa góc"],
-    }
-    room_key = _normalize_room_type_key(rf.roomType)
-    need_cats = REQUIRED_CATEGORIES.get(room_key, [])
-
-    present = { _normalize_lookup_key(p.category) for p in selected }
-    missing = [c for c in need_cats if _normalize_lookup_key(c) not in present]
-
-    # For each missing required category, fetch up to 2 products and prepend them
-    if missing:
-        try:
-            fallback_items: List[Product] = []
-            for req_cat in missing:
-                q = {"category": req_cat}
-                cursor = col.find(q).limit(2)
-                async for doc in cursor:
-                    pid = str(doc.get("_id", ""))
-                    # Skip duplicates
-                    if any(p.id == pid for p in selected) or any(p.id == pid for p in fallback_items):
-                        continue
-
-                    # Minimal Product conversion
-                    doc_images = doc.get("images", []) or []
-                    image_url = None
-                    if doc_images:
-                        if isinstance(doc_images[0], str):
-                            image_url = doc_images[0]
-                        elif isinstance(doc_images[0], dict):
-                            image_url = doc_images[0].get("url") or doc_images[0].get("imageUrl")
-
-                    fallback_items.append(Product(
-                        id=pid,
-                        name=doc.get("name", ""),
-                        category=doc.get("category", req_cat),
-                        styles=doc.get("styles", []),
-                        price=doc.get("price"),
-                        dimensions=None,
-                        colors=[],
-                        imageUrl=image_url,
-                        color_distance=None,
-                        ranking_score=None,
-                    ))
-
-            # Prepend fallback items while preserving top_n limit
-            if fallback_items:
-                # Avoid duplicates
-                deduped = []
-                existing_ids = {p.id for p in selected}
-                for fi in fallback_items:
-                    if fi.id not in existing_ids:
-                        deduped.append(fi)
-                        existing_ids.add(fi.id)
-
-                selected = deduped + selected
-                selected = selected[:top_n]
-        except Exception:
-            # Best-effort: if DB fallback fails, continue with current selection
-            pass
 
     return selected, total_candidates, warning, density_applied
     

@@ -80,9 +80,6 @@ class GeminiAnalysisResult(BaseModel):
     # Room visibility assessment: FULL | PARTIAL | MINIMAL
     roomVisibility: Optional[str] = None
     visibilityWarning: Optional[str] = None
-    # Room content validation
-    roomContentValid: bool = True
-    missingFurniture: Optional[List[str]] = None
     imageAnalysis: ImageAnalysis
     recommendedFilter: RecommendedFilter
     reasoning: AnalysisReasoning

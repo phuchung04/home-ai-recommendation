@@ -513,8 +513,6 @@ def _hydrate_non_room_payload(parsed: dict, req: RecommendRequest) -> dict:
     # When not a room, visibility is minimal and content invalid
     parsed["roomVisibility"] = "MINIMAL"
     parsed["visibilityWarning"] = parsed.get("visibilityWarning") or "Ảnh không cho đủ góc nhìn phòng để phân tích."
-    parsed["roomContentValid"] = False
-    parsed["missingFurniture"] = parsed.get("missingFurniture") or []
     return parsed
 
 
@@ -729,14 +727,19 @@ Set "roomVisibility":
 - "MINIMAL" → < 30% (chỉ thấy 1 góc tường hoặc 1 vật thể)
 Set "visibilityWarning": chuỗi giải thích nếu PARTIAL/MINIMAL, null nếu FULL
 
-### Room Content Validation (chỉ khi isRoom: true)
-User đã chọn roomType: "{room_type_value}"
+    ### Room Content Validation (chỉ khi isRoom: true)
+    Assess whether the image shows sufficient contextual furniture for meaningful recommendations.
+    - Set "roomContentValid": true when the image provides clear context for furnishing suggestions.
+    - Set "missingFurniture": list any notably absent major items when relevant, or [] if not applicable.
+    Note: Do NOT enforce hard-coded mandatory categories that would prevent returning reasonable suggestions.
 
-BEDROOM requires: bed/mattress AND nightstand/bedside table
-LIVING_ROOM requires: sofa/couch/sectional
+    ### MANDATORY category inclusion (CRITICAL — ngôn ngữ mô hình)
+    For Bedroom ONLY: The "categories" array MUST include AT LEAST one of:
+    - "Giường" (bed/mattress) OR "Nệm" (mattress)
+    This is non-negotiable. If Gemini detects a bedroom, "Giường" MUST be in the output,
+    even if image analysis suggests sparse density or lack of obvious beds.
+    Never omit "Giường" from a bedroom recommendation.
 
-Set "roomContentValid": true nếu đủ, false nếu thiếu
-Set "missingFurniture": danh sách thiếu (list), [] nếu đủ
 
 ### Output Format
 Respond ONLY with a valid JSON object. No explanation outside the JSON.
