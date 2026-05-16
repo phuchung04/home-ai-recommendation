@@ -86,3 +86,46 @@ async def load_behavior_matrix() -> Tuple[csr_matrix, Dict, Dict]:
     )
 
     return matrix, user_index, item_index
+
+
+async def get_user_event_count(user_id: str) -> int:
+    """
+    Return the total number of behavior events for a given user_id.
+    """
+    if not user_id:
+        return 0
+    client = AsyncIOMotorClient(MONGO_URI)
+    db = client[DB_NAME]
+    col = db[BEHAVIOR_COLLECTION]
+
+    # Normalize to string for stored ids
+    count = await col.count_documents({"userId": str(user_id)})
+    return int(count)
+
+
+async def get_popular_product_scores(product_ids: list) -> Dict[str, int]:
+    """
+    Aggregate global event counts for the provided product_ids.
+    Returns a mapping {productId: count}.
+    """
+    if not product_ids:
+        return {}
+    client = AsyncIOMotorClient(MONGO_URI)
+    db = client[DB_NAME]
+    col = db[BEHAVIOR_COLLECTION]
+
+    pipeline = [
+        {"$match": {"productId": {"$in": [str(p) for p in product_ids]}}},
+        {"$group": {"_id": "$productId", "count": {"$sum": 1}}},
+    ]
+    cursor = col.aggregate(pipeline)
+    result = {}
+    async for doc in cursor:
+        pid = str(doc.get("_id"))
+        result[pid] = int(doc.get("count", 0))
+
+    # Ensure all requested ids present (missing => 0)
+    for pid in product_ids:
+        result.setdefault(str(pid), 0)
+
+    return result

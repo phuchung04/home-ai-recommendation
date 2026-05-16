@@ -354,3 +354,18 @@ async def auto_train_on_startup():
         print("[CF] Auto-training completed")
     except Exception as e:
         print(f"[CF] Auto-training failed: {e}")
+
+
+async def get_user_behavior_count(user_id: str) -> int:
+    """
+    Helper to return the number of behavior events for a user.
+    Delegates to behavior_service to avoid direct cyclic imports elsewhere.
+    """
+    if not user_id:
+        return 0
+    try:
+        from app.services.behavior_service import get_user_event_count
+
+        return await get_user_event_count(user_id)
+    except Exception:
+        return 0

@@ -73,6 +73,30 @@ async def recommend_furniture(
             },
         )
 
+    # If room visibility is too limited, block and ask for a wider shot
+    if getattr(analysis, "roomVisibility", None) == "MINIMAL":
+        raise HTTPException(status_code=422, detail={
+            "error": "INSUFFICIENT_ROOM_VIEW",
+            "message": "Góc chụp quá hẹp, không đủ thông tin để gợi ý sản phẩm.",
+            "reason": analysis.visibilityWarning,
+        })
+
+    # Validate required furniture/content for the selected room type
+    # NOTE: Do not block the recommendation flow when required furniture is missing.
+    # Instead, attach a friendly warning message so the frontend can inform the user
+    ROOM_CONTENT_MESSAGES = {
+        "Bedroom": "Phòng ngủ nên có giường/nệm và bàn đầu giường.",
+        "Living Room": "Phòng khách nên có sofa.",
+    }
+    content_warning = None
+    if getattr(analysis, "roomContentValid", True) is False:
+        missing = analysis.missingFurniture or []
+        base = ROOM_CONTENT_MESSAGES.get(req.room_type, "Phòng có thể thiếu nội thất cần thiết.")
+        if missing:
+            content_warning = f"{base} Thiếu: {', '.join(missing)}."
+        else:
+            content_warning = base
+
     # 4. MongoDB query + semantic ranking
     try:
         products, total_candidates, warning, density_applied = await get_recommendations(
@@ -83,12 +107,17 @@ async def recommend_furniture(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database query failed: {exc}")
 
+    # Merge warnings: gemini/mongo warning take precedence, but include content warning if present
+    final_warning = warning
+    if not final_warning and content_warning:
+        final_warning = content_warning
+
     return RecommendResponse(
         analysis=analysis,
         products=products,
         total_candidates=total_candidates,
         total_returned=len(products),
-        warning=warning,
+        warning=final_warning,
         densityApplied=density_applied,
     )
 

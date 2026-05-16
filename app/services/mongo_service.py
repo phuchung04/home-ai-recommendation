@@ -10,7 +10,8 @@ from typing import List, Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from app.services.cf_model import get_cf_scores
+from app.services.cf_model import get_cf_scores, get_user_behavior_count
+from app.services.behavior_service import get_popular_product_scores
 from app.models.schemas import GeminiAnalysisResult, Product, ProductDimensions
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -226,6 +227,19 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
     gemini_category_names = [c.category for c in rf.categories]
     category_names = _merge_unique(tier_categories + gemini_category_names)
 
+    # Ensure required categories for the room type are present in the category list
+    REQUIRED_CATEGORIES = {
+        "bedroom": ["Giường", "Nệm", "Bàn đầu giường"],
+        "living room": ["Sofa", "Sofa góc"],
+    }
+    room_key = _normalize_room_type_key(rf.roomType)
+    req_cats = REQUIRED_CATEGORIES.get(room_key, [])
+    # If none of the required categories are present, inject them at the front
+    normalized_names = {c.casefold() for c in category_names}
+    to_inject = [c for c in req_cats if c.casefold() not in normalized_names]
+    if to_inject:
+        category_names = to_inject + category_names
+
     max_product_area = getattr(rf, "maxProductArea", rf.maxProductWidth * rf.maxProductDepth)
 
     # Build base query with mandatory category filter
@@ -341,10 +355,47 @@ async def get_recommendations(
             "category_rank": category_rank,
         })
 
-    # Step 2: Get Collaborative Filtering scores
-    cf_scores = {}
+    # Step 2: Get Collaborative Filtering scores and adaptive weights
+    behavior_count = 0
     if user_id:
-        cf_scores = get_cf_scores(user_id, product_ids_for_cf)
+        try:
+            behavior_count = await get_user_behavior_count(user_id)
+        except Exception:
+            behavior_count = 0
+
+    # Select weights based on behavior_count
+    if behavior_count == 0:
+        cf_weight = 0.0
+        style_w = 0.50
+        color_w = 0.30
+        stock_w = 0.20
+    elif 1 <= behavior_count <= 19:
+        cf_weight = 0.10
+        style_w = 0.45
+        color_w = 0.30
+        stock_w = 0.15
+    elif 20 <= behavior_count <= 49:
+        cf_weight = 0.15
+        style_w = 0.42
+        color_w = 0.28
+        stock_w = 0.15
+    else:
+        cf_weight = 0.20
+        style_w = 0.40
+        color_w = 0.25
+        stock_w = 0.15
+
+    cf_scores = get_cf_scores(user_id, product_ids_for_cf) if user_id else {}
+
+    # Popularity boost for cold-start users
+    popularity_scores = {}
+    popularity_weight = 0.0
+    if behavior_count < 20 and product_ids_for_cf:
+        try:
+            popularity_scores = await get_popular_product_scores(product_ids_for_cf)
+            popularity_weight = 0.05
+        except Exception:
+            popularity_scores = {}
 
     # Step 3: Calculate final ranking score and build Product objects
     candidates: List[Product] = []
@@ -353,19 +404,19 @@ async def get_recommendations(
         scores = data["scores"]
         cf_score = cf_scores.get(data["product_id"], 0.0)
 
-        if cf_scores:  # New weights if CF is active
-            ranking_score = (
-                (scores["style"] * 0.40) +
-                (scores["color"] * 0.25) +
-                (scores["stock"] * 0.15) +
-                (cf_score * 0.20)
-            )
-        else:  # Original weights
-            ranking_score = (
-                (scores["style"] * 0.5) +
-                (scores["color"] * 0.3) +
-                (scores["stock"] * 0.2)
-            )
+        # Weighted ranking using adaptive CF weight and optional popularity boost
+        ranking_score = (
+            (scores["style"] * style_w)
+            + (scores["color"] * color_w)
+            + (scores["stock"] * stock_w)
+            + (cf_score * cf_weight)
+        )
+        # Add small popularity boost for cold-start users
+        if popularity_weight > 0:
+            pop_count = popularity_scores.get(data["product_id"], 0)
+            max_pop = max(popularity_scores.values()) if popularity_scores else 0
+            pop_norm = (pop_count / max_pop) if max_pop > 0 else 0
+            ranking_score += pop_norm * popularity_weight
         
         # Ensure ranking_score is never negative
         ranking_score = max(0.0, ranking_score)
@@ -482,7 +533,70 @@ async def get_recommendations(
         if len(selected) >= top_n:
             break
 
+    # Guarantee at least one product from required categories for the room type
+    REQUIRED_CATEGORIES = {
+        "bedroom": ["Giường", "Nệm", "Bàn đầu giường"],
+        "living room": ["Sofa", "Sofa góc"],
+    }
+    room_key = _normalize_room_type_key(rf.roomType)
+    need_cats = REQUIRED_CATEGORIES.get(room_key, [])
+
+    present = { _normalize_lookup_key(p.category) for p in selected }
+    missing = [c for c in need_cats if _normalize_lookup_key(c) not in present]
+
+    # For each missing required category, fetch up to 2 products and prepend them
+    if missing:
+        try:
+            fallback_items: List[Product] = []
+            for req_cat in missing:
+                q = {"category": req_cat}
+                cursor = col.find(q).limit(2)
+                async for doc in cursor:
+                    pid = str(doc.get("_id", ""))
+                    # Skip duplicates
+                    if any(p.id == pid for p in selected) or any(p.id == pid for p in fallback_items):
+                        continue
+
+                    # Minimal Product conversion
+                    doc_images = doc.get("images", []) or []
+                    image_url = None
+                    if doc_images:
+                        if isinstance(doc_images[0], str):
+                            image_url = doc_images[0]
+                        elif isinstance(doc_images[0], dict):
+                            image_url = doc_images[0].get("url") or doc_images[0].get("imageUrl")
+
+                    fallback_items.append(Product(
+                        id=pid,
+                        name=doc.get("name", ""),
+                        category=doc.get("category", req_cat),
+                        styles=doc.get("styles", []),
+                        price=doc.get("price"),
+                        dimensions=None,
+                        colors=[],
+                        imageUrl=image_url,
+                        color_distance=None,
+                        ranking_score=None,
+                    ))
+
+            # Prepend fallback items while preserving top_n limit
+            if fallback_items:
+                # Avoid duplicates
+                deduped = []
+                existing_ids = {p.id for p in selected}
+                for fi in fallback_items:
+                    if fi.id not in existing_ids:
+                        deduped.append(fi)
+                        existing_ids.add(fi.id)
+
+                selected = deduped + selected
+                selected = selected[:top_n]
+        except Exception:
+            # Best-effort: if DB fallback fails, continue with current selection
+            pass
+
     return selected, total_candidates, warning, density_applied
+    
 
 
 

@@ -359,6 +359,10 @@ def _build_response_schema() -> dict:
         "properties": {
             "isRoom": {"type": "boolean"},
             "notRoomReason": {"type": ["string", "null"]},
+            "roomVisibility": {"type": ["string", "null"]},
+            "visibilityWarning": {"type": ["string", "null"]},
+            "roomContentValid": {"type": "boolean"},
+            "missingFurniture": {"type": ["array", "null"], "items": {"type": "string"}},
             "imageAnalysis": {
                 "type": "object",
                 "required": [
@@ -454,6 +458,11 @@ def _ensure_analysis_defaults(parsed: dict, req: RecommendRequest) -> dict:
 
     parsed.setdefault("isRoom", True)
     parsed.setdefault("notRoomReason", None)
+    # Visibility and content defaults
+    parsed.setdefault("roomVisibility", "FULL")
+    parsed.setdefault("visibilityWarning", None)
+    parsed.setdefault("roomContentValid", True)
+    parsed.setdefault("missingFurniture", [])
 
     room_area_m2 = _get_room_area_m2(req)
     max_product_area = round(room_area_m2 * 10000 * 0.10, 1)
@@ -501,6 +510,11 @@ def _hydrate_non_room_payload(parsed: dict, req: RecommendRequest) -> dict:
 
     parsed["isRoom"] = False
     parsed["notRoomReason"] = parsed.get("notRoomReason") or "Không nhận diện được phòng từ ảnh tải lên."
+    # When not a room, visibility is minimal and content invalid
+    parsed["roomVisibility"] = "MINIMAL"
+    parsed["visibilityWarning"] = parsed.get("visibilityWarning") or "Ảnh không cho đủ góc nhìn phòng để phân tích."
+    parsed["roomContentValid"] = False
+    parsed["missingFurniture"] = parsed.get("missingFurniture") or []
     return parsed
 
 
@@ -602,6 +616,11 @@ def _build_fallback_analysis(req: RecommendRequest) -> GeminiAnalysisResult:
             "densityJustification": f"Giới hạn kích thước được suy từ kích thước phòng và mật độ '{req.furniture_density.value}' để tránh đề xuất đồ quá lớn.",
             "userProfileNote": user_profile_note,
         },
+        # New fields for visibility and content validation
+        roomVisibility="FULL",
+        visibilityWarning=None,
+        roomContentValid=True,
+        missingFurniture=[],
         warning=warning,
         densityApplied=density_applied,
     )
@@ -703,6 +722,22 @@ If the image is ambiguous (e.g., partially visible room, unusual angle):
 - Set "isRoom": true only if you are >= 80% confident it is an interior room
 - Otherwise set "isRoom": false and explain in "notRoomReason"
 
+### Room Visibility Assessment (chỉ khi isRoom: true)
+Set "roomVisibility":
+- "FULL"    → ≥ 60% diện tích phòng rõ ràng
+- "PARTIAL" → 30–60% phòng hiển thị (một góc, một phần)
+- "MINIMAL" → < 30% (chỉ thấy 1 góc tường hoặc 1 vật thể)
+Set "visibilityWarning": chuỗi giải thích nếu PARTIAL/MINIMAL, null nếu FULL
+
+### Room Content Validation (chỉ khi isRoom: true)
+User đã chọn roomType: "{room_type_value}"
+
+BEDROOM requires: bed/mattress AND nightstand/bedside table
+LIVING_ROOM requires: sofa/couch/sectional
+
+Set "roomContentValid": true nếu đủ, false nếu thiếu
+Set "missingFurniture": danh sách thiếu (list), [] nếu đủ
+
 ### Output Format
 Respond ONLY with a valid JSON object. No explanation outside the JSON.
 
@@ -726,6 +761,10 @@ Analyze the room context and user profile, then recommend the most suitable furn
 {{
     "isRoom": true,
     "notRoomReason": null,
+    "roomVisibility": "FULL",
+    "visibilityWarning": null,
+    "roomContentValid": true,
+    "missingFurniture": [],
   "imageAnalysis": {{
     "dominantColors": ["#hex1", "#hex2", "#hex3"],
     "colorTone": "warm|cool|neutral",
