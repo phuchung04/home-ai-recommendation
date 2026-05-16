@@ -249,7 +249,11 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
 
     # Build base query with mandatory category filter
     room_key = _normalize_room_type_key(rf.roomType)
-    excluded_categories = ["Ghế ăn", "Bàn ăn", "Sofa", "Sofa góc", "Tủ tivi", "Bàn nước"]
+    
+    # Excluded categories are large items we handle separately via OR clauses
+    excluded_categories = ["Ghế ăn", "Bàn ăn", "Tủ tivi", "Bàn nước"]
+    if room_key == "bedroom":
+        excluded_categories.extend(["Sofa", "Sofa góc"])
     
     # Filter category list: include required + remove excluded
     filtered_categories = [c for c in category_names_with_required if c not in excluded_categories]
@@ -295,22 +299,42 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
         
         query = {"$or": or_clauses} if or_clauses else {"category": {"$in": filtered_categories}}
     else:
-        # Living room: standard strict query
-        query = {
-            "category": {"$in": filtered_categories},
-            "$or": [
-                {"styles": {"$in": style_patterns}},
-                {"dimensions.width": {"$lte": rf.maxProductWidth}},
-            ],
-            "dimensions.width": {"$lte": rf.maxProductWidth},
-            "dimensions.depth": {"$lte": rf.maxProductDepth},
-            "$expr": {
-                "$lte": [
-                    {"$multiply": [{"$ifNull": ["$dimensions.width", 0]}, {"$ifNull": ["$dimensions.depth", 0]}]},
-                    max_product_area,
+        # Living room: similar core-item logic for Sofas
+        SOFA_CATS = {"sofa", "sofa góc"}
+        sofa_cats = [c for c in filtered_categories if _normalize_lookup_key(c) in SOFA_CATS]
+        other_cats = [c for c in filtered_categories if _normalize_lookup_key(c) not in SOFA_CATS]
+
+        or_clauses = []
+        
+        # Sofas: relaxed dimension filter (they can be long)
+        if sofa_cats:
+            or_clauses.append({
+                "category": {"$in": sofa_cats},
+                "$or": [
+                    {"dimensions.width": {"$exists": False}},
+                    {"dimensions.width": {"$lte": rf.maxProductWidth * 1.25}},
                 ]
-            },
-        }
+            })
+        
+        # Other living room items: standard strict query
+        if other_cats:
+            or_clauses.append({
+                "category": {"$in": other_cats},
+                "$or": [
+                    {"styles": {"$in": style_patterns}},
+                    {"dimensions.width": {"$lte": rf.maxProductWidth}},
+                ],
+                "dimensions.width": {"$lte": rf.maxProductWidth},
+                "dimensions.depth": {"$lte": rf.maxProductDepth},
+                "$expr": {
+                    "$lte": [
+                        {"$multiply": [{"$ifNull": ["$dimensions.width", 0]}, {"$ifNull": ["$dimensions.depth", 0]}]},
+                        max_product_area,
+                    ]
+                },
+            })
+        
+        query = {"$or": or_clauses} if or_clauses else {"category": {"$in": filtered_categories}}
     
     return query
 
@@ -402,7 +426,7 @@ async def get_recommendations(
             "category_rank": category_rank,
         })
 
-    # If no bed/mattress candidates were found for a bedroom, run a relaxed fallback
+    # Fallback for core items
     room_key = _normalize_room_type_key(rf.roomType)
     if room_key == "bedroom":
         has_bed = any(
@@ -451,7 +475,53 @@ async def get_recommendations(
                         "category_rank": category_rank,
                     })
             except Exception:
-                # fallback should be best-effort; ignore failures and continue
+                pass
+    elif room_key == "living room":
+        has_sofa = any(
+            _normalize_lookup_key(d.get("doc", {}).get("category", "")) in {"sofa", "sofa góc"}
+            for d in candidate_data
+        )
+        if not has_sofa:
+            try:
+                sofa_query = {"category": {"$in": ["Sofa", "Sofa góc"]}}
+                sofa_cursor = col.find(sofa_query).limit(12)
+                async for sdoc in sofa_cursor:
+                    s_id = str(sdoc.get("_id", ""))
+                    if s_id in product_ids_for_cf:
+                        continue
+                    s_styles = sdoc.get("styles", [])
+                    s_color_obj = sdoc.get("color")
+                    if isinstance(s_color_obj, dict):
+                        s_colors = [s_color_obj.get("hex")] if s_color_obj.get("hex") else []
+                    elif isinstance(s_color_obj, list):
+                        s_colors = [c.get("hex") for c in s_color_obj if isinstance(c, dict) and c.get("hex")]
+                    else:
+                        s_colors = []
+                    
+                    prod_styles_lower = {s.lower() for s in s_styles}
+                    matching_styles = len(target_styles_lower.intersection(prod_styles_lower))
+                    style_match_score = min(matching_styles / (len(target_styles_lower) or 1), 1.0)
+                    color_dist = _min_color_distance(s_colors, target_colors)
+                    color_score = max(0.0, 1.0 - (color_dist / max_color_dist))
+                    in_stock_score = 1.0 if sdoc.get("inStock", True) else 0.0
+
+                    product_ids_for_cf.append(s_id)
+                    category_rank = tier_lookup.get(_normalize_lookup_key(sdoc.get("category", "")), len(room_tiers))
+
+                    candidate_data.append({
+                        "doc": sdoc,
+                        "product_id": s_id,
+                        "scores": {
+                            "style": style_match_score,
+                            "color": color_score,
+                            "stock": in_stock_score,
+                        },
+                        "color_dist": color_dist,
+                        "prod_colors": s_colors,
+                        "prod_styles": s_styles,
+                        "category_rank": category_rank,
+                    })
+            except Exception:
                 pass
 
     # Step 2: Get Collaborative Filtering scores and adaptive weights

@@ -734,11 +734,10 @@ Set "visibilityWarning": chuỗi giải thích nếu PARTIAL/MINIMAL, null nếu
     Note: Do NOT enforce hard-coded mandatory categories that would prevent returning reasonable suggestions.
 
     ### MANDATORY category inclusion (CRITICAL — ngôn ngữ mô hình)
-    For Bedroom ONLY: The "categories" array MUST include AT LEAST one of:
-    - "Giường" (bed/mattress) OR "Nệm" (mattress)
-    This is non-negotiable. If Gemini detects a bedroom, "Giường" MUST be in the output,
-    even if image analysis suggests sparse density or lack of obvious beds.
-    Never omit "Giường" from a bedroom recommendation.
+    - For Bedroom: The "categories" array MUST include AT LEAST one of: "Giường" (bed) OR "Nệm" (mattress).
+    - For Living Room: The "categories" array MUST include AT LEAST one of: "Sofa" OR "Sofa góc" (sectional sofa).
+    
+    This is non-negotiable. If Gemini detects the room type, these core categories MUST be in the output, even if image analysis suggests sparse density. Never omit core furniture from recommendations.
 
 
 ### Output Format
