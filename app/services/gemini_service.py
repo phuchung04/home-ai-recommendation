@@ -241,10 +241,8 @@ def _adjust_density_for_area(area_m2: float, density: str) -> tuple[str, Optiona
     density_value = density if isinstance(density, str) else str(density)
     density_key = density_value.strip().casefold()
 
-    if area_m2 < 6:
+    if area_m2 <= 10:
         applied = "sparse"
-    elif area_m2 < 8:
-        applied = "sparse" if density_key in {"medium", "dense"} else density_value
     else:
         applied = density_value
 
