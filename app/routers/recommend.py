@@ -54,6 +54,8 @@ async def recommend_furniture(
     if image and image.filename:
         image_bytes = await image.read()
         image_mime = image.content_type or "image/jpeg"
+        if image_mime.strip().lower().split(";", 1)[0].strip() == "application/octet-stream":
+            image_mime = "image/jpeg"
 
     # 3. Gemini analysis
     try:

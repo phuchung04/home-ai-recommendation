@@ -71,6 +71,41 @@ def _is_daily_quota_exhausted(resp: httpx.Response) -> bool:
     return "RESOURCE_EXHAUSTED" in body_text or "QUOTA" in body_text
 
 
+def _is_invalid_api_key(resp: httpx.Response) -> bool:
+    """Detect Gemini API key invalidation or expiration."""
+    reason = _extract_gemini_error_reason(resp)
+    if reason == "API_KEY_INVALID":
+        return True
+
+    body_text = (resp.text or "").upper()
+    return any(token in body_text for token in ["API KEY EXPIRED", "API_KEY_INVALID", "KEY INVALID"])
+
+
+def _normalize_image_mime_type(image_bytes: Optional[bytes], declared_mime: str) -> str:
+    """Normalize or recover the image MIME type before sending to Gemini."""
+    supported = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/gif"}
+    declared = declared_mime.strip().lower().split(";", 1)[0].strip() if isinstance(declared_mime, str) else ""
+    if declared in supported:
+        return declared
+
+    if not image_bytes or len(image_bytes) < 12:
+        return "image/jpeg"
+
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"GIF8"):
+        return "image/gif"
+    if image_bytes.startswith(b"BM"):
+        return "image/bmp"
+    if image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+
+    # Fallback to a safe default when the declared type is unknown.
+    return "image/jpeg"
+
+
 def _extract_json_text(raw_text: str) -> str:
     """Best-effort extraction of a JSON object from model output."""
     if not raw_text:
@@ -873,10 +908,11 @@ async def analyze_room(
     prompt_text = _build_prompt(req)
 
     parts = []
+    normalized_mime = _normalize_image_mime_type(image_bytes, image_mime)
     if image_bytes:
         parts.append({
             "inline_data": {
-                "mime_type": image_mime,
+                "mime_type": normalized_mime,
                 "data": base64.b64encode(image_bytes).decode("utf-8"),
             }
         })
@@ -957,6 +993,13 @@ async def analyze_room(
             if status == 400:
                 error_detail = resp.text[:300] if resp.text else "Bad Request"
                 print(f"[Gemini] HTTP 400 error: {error_detail}")
+                if _is_invalid_api_key(resp):
+                    _key_pool.mark_exhausted(current_key)
+                    print(f"[Gemini] Invalid/expired API key detected, switching to next key...")
+                    continue
+                if "UNSUPPORTED MIME TYPE" in error_detail.upper():
+                    print("[Gemini] Unsupported inline image MIME type; using fallback analysis.")
+                    return _build_fallback_analysis(req)
                 raise HTTPException(status_code=400, detail=f"Invalid Gemini request: {error_detail[:100]}")
 
             resp.raise_for_status()
